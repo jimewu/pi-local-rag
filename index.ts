@@ -465,9 +465,9 @@ export default function (pi: ExtensionAPI) {
       // ── index ──
       if (cmd === "index") {
         const path = parts[1] || ".";
-        if (!existsSync(path)) return `${RED}Path not found:${RST} ${path}`;
+        if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
         const files = collectFiles(path);
-        if (!files.length) return `${YELLOW}No indexable files found in:${RST} ${path}`;
+        if (!files.length) { ctx.ui.notify(`No indexable files found in: ${path}`, "warning"); return; }
 
         const total = files.length;
         ctx.ui.notify(`Found ${total} files to index`, "info");
@@ -500,31 +500,38 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        return `${GREEN}✅ Indexed:${RST} ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s\n` +
-          `${D}Model: ${EMBEDDING_MODEL} │ Storage: ${RAG_DIR}${RST}`;
+        ctx.ui.notify(`✅ Indexed ${result.indexed} files (${result.chunks} chunks) · ${result.skipped} unchanged · ${secs}s`, "info");
+        return;
       }
 
       // ── search ──
       if (cmd === "search") {
         const query = parts.slice(1).join(" ");
-        if (!query) return `${YELLOW}Usage:${RST} /rag search <query>`;
+        if (!query) { ctx.ui.notify("Usage: /rag search <query>", "warning"); return; }
         const index = loadIndex();
         const config = loadConfig();
         const results = await hybridSearch(query, index, 10, config.ragAlpha);
-        if (!results.length) return `${YELLOW}No results for:${RST} ${query}`;
+        if (!results.length) { ctx.ui.notify(`No results for: ${query}`, "warning"); return; }
 
+        const th = ctx.ui.theme;
         const hasVectors = index.chunks.some(c => c.vector);
-        let out = `${B}${CYAN}🔍 ${results.length} results for "${query}"${RST}`;
-        out += ` ${D}(${hasVectors ? "hybrid BM25+vector" : "BM25 only — run /rag index to add vectors"})${RST}\n\n`;
-
+        const lines: string[] = [
+          th.bold(th.fg("accent", "🔍 ") + `${results.length} results for "${query}"`) +
+            "  " + th.fg("dim", hasVectors ? "hybrid BM25+vector" : "BM25 only"),
+          "",
+        ];
         for (const r of results) {
-          const bar = "█".repeat(Math.round(r.hybrid * 10)) + "░".repeat(10 - Math.round(r.hybrid * 10));
-          out += `${GREEN}${basename(r.chunk.file)}${RST}:${r.chunk.lineStart}-${r.chunk.lineEnd} `;
-          out += `${D}bm25=${r.bm25.toFixed(2)} vec=${r.vector.toFixed(2)} hybrid=${r.hybrid.toFixed(2)}${RST} ${CYAN}${bar}${RST}\n`;
+          lines.push(
+            th.fg("success", basename(r.chunk.file)) +
+            th.fg("muted", `:${r.chunk.lineStart}-${r.chunk.lineEnd}`) +
+            "  " + th.fg("dim", `score=${r.hybrid.toFixed(2)}`)
+          );
           const preview = r.chunk.content.split("\n").slice(0, 3).join("\n");
-          out += `${D}${preview.slice(0, 200)}${RST}\n\n`;
+          lines.push(th.fg("dim", preview.slice(0, 200)));
+          lines.push("");
         }
-        return out;
+        ctx.ui.setWidget("rag-search", lines);
+        return;
       }
 
       // ── on/off toggle ──
@@ -532,16 +539,15 @@ export default function (pi: ExtensionAPI) {
         const config = loadConfig();
         config.ragEnabled = cmd === "on";
         saveConfig(config);
-        return cmd === "on"
-          ? `${GREEN}✅ RAG auto-injection enabled${RST}`
-          : `${YELLOW}RAG auto-injection disabled${RST}`;
+        ctx.ui.notify(cmd === "on" ? "RAG auto-injection enabled" : "RAG auto-injection disabled", "info");
+        return;
       }
 
       // ── rebuild ──
       if (cmd === "rebuild") {
         const index = loadIndex();
         const allFiles = Object.keys(index.files);
-        if (!allFiles.length) return `${YELLOW}No files in index. Run /rag index <path> first.${RST}`;
+        if (!allFiles.length) { ctx.ui.notify("No files in index. Run /rag index <path> first.", "warning"); return; }
 
         const existingFiles = allFiles.filter(f => existsSync(f));
         const deletedFiles = allFiles.filter(f => !existsSync(f));
@@ -586,7 +592,8 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        return `${GREEN}✅ Rebuilt:${RST} ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`;
+        ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${deletedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
+        return;
       }
 
       // ── ext (configure file extensions) ──
@@ -595,48 +602,59 @@ export default function (pi: ExtensionAPI) {
         const config = loadConfig();
 
         if (sub === "list") {
+          const th = ctx.ui.theme;
           const active = Array.from(resolveExtensions(config)).sort();
-          let out = `${B}${CYAN}Active file extensions${RST} ${D}(${active.length})${RST}\n`;
-          out += `  ${active.join(" ")}\n\n`;
-          if (config.extraExtensions.length) out += `  ${D}extra:   ${RST}${GREEN}${config.extraExtensions.join(" ")}${RST}\n`;
-          if (config.excludeExtensions.length) out += `  ${D}excluded:${RST} ${YELLOW}${config.excludeExtensions.join(" ")}${RST}\n`;
-          out += `\n${D}Edit via /rag ext add <.ext> / remove <.ext> / reset, or ${CONFIG_FILE}${RST}`;
-          return out;
+          const lines: string[] = [
+            th.bold("Active file extensions") + "  " + th.fg("dim", `(${active.length})`),
+            th.fg("muted", "  " + active.join(" ")),
+          ];
+          if (config.extraExtensions.length)
+            lines.push("  " + th.fg("dim", "extra:   ") + th.fg("success", config.extraExtensions.join(" ")));
+          if (config.excludeExtensions.length)
+            lines.push("  " + th.fg("dim", "excluded:") + " " + th.fg("warning", config.excludeExtensions.join(" ")));
+          lines.push("", th.fg("dim", "Edit via /rag ext add <.ext> / remove <.ext> / reset"));
+          ctx.ui.setWidget("rag-ext", lines);
+          return;
         }
 
         if (sub === "add") {
           const ext = normalizeExt(parts[2] || "");
-          if (!ext) return `${YELLOW}Usage:${RST} /rag ext add <.ext>`;
+          if (!ext) { ctx.ui.notify("Usage: /rag ext add <.ext>", "warning"); return; }
           config.excludeExtensions = config.excludeExtensions.filter(e => normalizeExt(e) !== ext);
           if (!config.extraExtensions.map(normalizeExt).includes(ext)) config.extraExtensions.push(ext);
           saveConfig(config);
-          return `${GREEN}✅ Added ${ext} to indexable extensions.${RST} ${D}Run /rag index <path> to pick up matching files.${RST}`;
+          ctx.ui.notify(`Added ${ext} to indexable extensions. Run /rag index <path> to pick up matching files.`, "info");
+          return;
         }
 
         if (sub === "remove" || sub === "rm") {
           const ext = normalizeExt(parts[2] || "");
-          if (!ext) return `${YELLOW}Usage:${RST} /rag ext remove <.ext>`;
+          if (!ext) { ctx.ui.notify("Usage: /rag ext remove <.ext>", "warning"); return; }
           const wasExtra = config.extraExtensions.map(normalizeExt).includes(ext);
           config.extraExtensions = config.extraExtensions.filter(e => normalizeExt(e) !== ext);
           if (!wasExtra && !config.excludeExtensions.map(normalizeExt).includes(ext)) config.excludeExtensions.push(ext);
           saveConfig(config);
-          return `${GREEN}✅ Removed ${ext} from indexable extensions.${RST}`;
+          ctx.ui.notify(`Removed ${ext} from indexable extensions.`, "info");
+          return;
         }
 
         if (sub === "reset") {
           config.extraExtensions = [];
           config.excludeExtensions = [];
           saveConfig(config);
-          return `${GREEN}✅ Extension list reset to defaults.${RST}`;
+          ctx.ui.notify("Extension list reset to defaults.", "info");
+          return;
         }
 
-        return `${YELLOW}Usage:${RST} /rag ext list|add <.ext>|remove <.ext>|reset`;
+        ctx.ui.notify("Usage: /rag ext list|add <.ext>|remove <.ext>|reset", "warning");
+        return;
       }
 
       // ── clear ──
       if (cmd === "clear") {
         saveIndex({ chunks: [], files: {}, lastBuild: "" });
-        return `${GREEN}✅ Index cleared.${RST}`;
+        ctx.ui.notify("Index cleared.", "info");
+        return;
       }
 
       // ── status (default) ──
@@ -647,26 +665,34 @@ export default function (pi: ExtensionAPI) {
       const embeddedCount = index.chunks.filter(c => c.vector).length;
       const vectorCoverage = index.chunks.length ? Math.round(embeddedCount / index.chunks.length * 100) : 0;
 
-      let out = `${B}${CYAN}🔍 pi-local-rag Status${RST}\n\n`;
-      out += `  Files indexed:   ${GREEN}${fileCount}${RST}\n`;
-      out += `  Chunks:          ${GREEN}${index.chunks.length}${RST}\n`;
-      out += `  Vectors:         ${GREEN}${embeddedCount}${RST} ${D}(${vectorCoverage}% coverage)${RST}\n`;
-      out += `  Total tokens:    ${GREEN}${totalTokens.toLocaleString()}${RST}\n`;
-      out += `  Embedding model: ${D}${index.embeddingModel || "none"}${RST}\n`;
-      out += `  Last build:      ${index.lastBuild || "never"}\n`;
-      out += `  Storage:         ${D}${RAG_DIR}${RST}\n\n`;
-      out += `  RAG injection:   ${config.ragEnabled ? `${GREEN}enabled${RST}` : `${YELLOW}disabled${RST}`}`;
-      out += `  topK=${config.ragTopK}  threshold=${config.ragScoreThreshold}  alpha=${config.ragAlpha}\n`;
+      const th = ctx.ui.theme;
+      const label = (k: string) => th.fg("dim", k.padEnd(18));
+      const val = (v: string | number) => th.fg("success", String(v));
+      const lines: string[] = [
+        th.bold("🔍 pi-local-rag"),
+        "",
+        "  " + label("Files indexed:")  + val(fileCount),
+        "  " + label("Chunks:")         + val(index.chunks.length),
+        "  " + label("Vectors:")        + val(embeddedCount) + "  " + th.fg("dim", `(${vectorCoverage}% coverage)`),
+        "  " + label("Total tokens:")   + val(totalTokens.toLocaleString()),
+        "  " + label("Embedding model:") + th.fg("dim", index.embeddingModel || "none"),
+        "  " + label("Last build:")     + (index.lastBuild || th.fg("dim", "never")),
+        "  " + label("Storage:")        + th.fg("dim", RAG_DIR),
+        "",
+        "  " + label("RAG injection:")  +
+          (config.ragEnabled ? th.fg("success", "enabled") : th.fg("warning", "disabled")) +
+          th.fg("dim", `  topK=${config.ragTopK}  threshold=${config.ragScoreThreshold}  alpha=${config.ragAlpha}`),
+      ];
 
       if (fileCount) {
-        out += `\n  ${B}File types:${RST}\n`;
+        lines.push("", "  " + th.bold("File types:"));
         const byExt: Record<string, number> = {};
         for (const f of Object.keys(index.files)) byExt[extname(f)] = (byExt[extname(f)] || 0) + 1;
         for (const [ext, count] of Object.entries(byExt).sort((a, b) => b[1] - a[1]).slice(0, 8)) {
-          out += `    ${ext}: ${count}\n`;
+          lines.push("    " + th.fg("muted", ext) + "  " + th.fg("dim", String(count)));
         }
       }
-      return out;
+      ctx.ui.setWidget("rag-status", lines);
     },
   });
 
