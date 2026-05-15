@@ -14,7 +14,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck"
+    "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck",
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts"
   },
   "keywords": [
     "pi-package",

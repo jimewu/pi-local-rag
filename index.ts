@@ -22,8 +22,9 @@ import { createHash } from "node:crypto";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const RAG_DIR = join(homedir(), ".pi", "rag");
-const LEGACY_DIR = join(homedir(), ".pi", "lens"); // renamed from lens → rag
+// Storage paths — overridable via env for tests / project-local indexes.
+const RAG_DIR = process.env.PI_RAG_DIR ?? join(homedir(), ".pi", "rag");
+const LEGACY_DIR = process.env.PI_RAG_LEGACY_DIR ?? join(homedir(), ".pi", "lens");
 const INDEX_FILE = join(RAG_DIR, "index.json");
 const CONFIG_FILE = join(RAG_DIR, "config.json");
 
@@ -33,7 +34,7 @@ const GREEN = "\x1b[32m", YELLOW = "\x1b[33m", CYAN = "\x1b[36m", RED = "\x1b[31
 const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 const VECTOR_DIM = 384;
 
-const TEXT_EXTS = new Set([
+export const TEXT_EXTS = new Set([
   ".md", ".txt", ".ts", ".js", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h",
   ".css", ".html", ".json", ".yaml", ".yml", ".toml", ".xml", ".csv", ".sh",
   ".sql", ".graphql", ".proto", ".env", ".gitignore", ".dockerfile",
@@ -73,7 +74,7 @@ interface RagConfig {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-function loadConfig(): RagConfig {
+export function loadConfig(): RagConfig {
   ensureDir();
   if (!existsSync(CONFIG_FILE)) return defaultConfig();
   try {
@@ -85,7 +86,7 @@ function defaultConfig(): RagConfig {
   return { ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4 };
 }
 
-function saveConfig(config: RagConfig) {
+export function saveConfig(config: RagConfig) {
   ensureDir();
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
@@ -107,7 +108,7 @@ function ensureDir() {
   }
 }
 
-function loadIndex(): IndexMeta {
+export function loadIndex(): IndexMeta {
   ensureDir();
   if (!existsSync(INDEX_FILE)) return { chunks: [], files: {}, lastBuild: "" };
   try {
@@ -121,7 +122,7 @@ function loadIndex(): IndexMeta {
   } catch { return { chunks: [], files: {}, lastBuild: "" }; }
 }
 
-function saveIndex(index: IndexMeta) {
+export function saveIndex(index: IndexMeta) {
   ensureDir();
   writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
 }
@@ -141,7 +142,7 @@ async function getEmbedder() {
   return _pipeline;
 }
 
-async function embed(text: string): Promise<number[]> {
+export async function embed(text: string): Promise<number[]> {
   const embedder = await getEmbedder();
   const output = await embedder(text, { pooling: "mean", normalize: true });
   return Array.from(output.data as Float32Array);
@@ -158,7 +159,7 @@ async function embedBatch(texts: string[], onProgress?: (i: number, total: numbe
 
 // ─── Math ────────────────────────────────────────────────────────────────────
 
-function cosineSimilarity(a: number[], b: number[]): number {
+export function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
   let dot = 0, normA = 0, normB = 0;
   for (let i = 0; i < a.length; i++) {
@@ -170,7 +171,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
-function normalize(scores: number[]): number[] {
+export function normalize(scores: number[]): number[] {
   const max = Math.max(...scores);
   const min = Math.min(...scores);
   const range = max - min;
@@ -180,7 +181,7 @@ function normalize(scores: number[]): number[] {
 
 // ─── Chunking & File Collection ──────────────────────────────────────────────
 
-function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
+export function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
   const lines = text.split("\n");
   const chunks: { content: string; lineStart: number; lineEnd: number }[] = [];
   let i = 0;
@@ -198,14 +199,15 @@ function chunkText(text: string, maxLines = 50): { content: string; lineStart: n
   return chunks;
 }
 
-function collectFiles(dirPath: string): string[] {
+export function collectFiles(dirPath: string, exts: Set<string> = TEXT_EXTS): string[] {
+  const allowed = exts;
   const files: string[] = [];
   function walk(dir: string) {
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.isDirectory()) {
           if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith(".")) walk(join(dir, entry.name));
-        } else if (TEXT_EXTS.has(extname(entry.name).toLowerCase())) {
+        } else if (allowed.has(extname(entry.name).toLowerCase())) {
           const fp = join(dir, entry.name);
           try {
             if (statSync(fp).size < 500_000) files.push(fp);
@@ -217,7 +219,7 @@ function collectFiles(dirPath: string): string[] {
   try {
     const stat = statSync(dirPath);
     if (stat.isFile()) {
-      if (!TEXT_EXTS.has(extname(dirPath).toLowerCase()) || stat.size >= 500_000) return [];
+      if (!allowed.has(extname(dirPath).toLowerCase()) || stat.size >= 500_000) return [];
       return [dirPath];
     }
   } catch { return []; }
@@ -322,7 +324,7 @@ interface ScoredChunk {
   hybrid: number;
 }
 
-async function hybridSearch(
+export async function hybridSearch(
   query: string,
   index: IndexMeta,
   limit = 10,
