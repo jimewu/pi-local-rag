@@ -1,6 +1,6 @@
 node_modules/
 *.js
 *.d.ts
-!types/**/*.d.ts
+!types/*.d.ts
 *.map
 .DS_Store
