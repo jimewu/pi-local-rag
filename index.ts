@@ -45,7 +45,7 @@ import ignore from "ignore";
 import { RST, B, D, GREEN, CYAN } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
-import { loadIndex, saveIndex } from "./index-store.ts";
+import { openDb, loadIndex, saveIndex, getIndexStats } from "./db.ts";
 import { collectFiles, collectFromTracked, isExcludedByConfig } from "./chunking.ts";
 import { hybridSearch } from "./search.ts";
 import { indexFiles, isIndexStale } from "./indexing.ts";
@@ -56,8 +56,8 @@ export { DEFAULT_TEXT_EXTS } from "./constants.ts";
 export { getRagDir, GLOBAL_RAG_DIR, LEGACY_DIR } from "./store.ts";
 export type { RagConfig } from "./config.ts";
 export { loadConfig, saveConfig, defaultConfig, normalizeExt, resolveExtensions } from "./config.ts";
-export type { Chunk, IndexMeta } from "./index-store.ts";
-export { loadIndex, saveIndex } from "./index-store.ts";
+export type { Chunk, IndexMeta, IndexStats } from "./db.ts";
+export { openDb, getDb, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
 export {
   sha256, chunkText, collectFiles, collectFromTracked, isExcludedByConfig, extractText,
 } from "./chunking.ts";
@@ -69,32 +69,42 @@ export { isIndexStale } from "./indexing.ts";
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // Throttle stale-index checks to once per hour so we don't repeatedly stat
+  // the filesystem on every agent turn (matches the upstream fork's
+  // lastStaleCheckMs pattern from kallewoof@849e485).
+  let lastStaleCheckMs = 0;
+  const STALE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+
   // ── Auto-inject RAG context before every agent turn ──
   pi.on("before_agent_start", async (event, _ctx) => {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    let index = loadIndex();
-    if (!index.chunks.length) return;
+    const database = openDb();
+    try {
+      const stats = getIndexStats(database);
+      if (stats.totalChunks === 0) return;
 
-    if (isIndexStale(index)) {
-      // Re-walk tracked paths so new files (and files of newly-supported
-      // extensions, e.g. PDF/DOCX added in a later version) are picked up.
-      // For pre-trackedPaths indexes, fall back to refreshing only known files.
-      const files = config.trackedPaths.length
-        ? collectFromTracked(config)
-        : Object.keys(index.files).filter(f => existsSync(f));
-      if (files.length) {
-        process.stderr.write(`\r\x1b[2K[rag] Index stale, refreshing ${files.length} files…`);
-        await indexFiles(files);
-        process.stderr.write(`\r\x1b[2K`);
-        index = loadIndex();
+      const indexMeta = { chunks: [], files: {}, lastBuild: stats.lastBuild, embeddingModel: stats.embeddingModel };
+      const now = Date.now();
+      if (isIndexStale(indexMeta) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
+        lastStaleCheckMs = now;
+        // Re-walk tracked paths so new files (and files of newly-supported
+        // extensions, e.g. PDF/DOCX added in a later version) are picked up.
+        // For pre-trackedPaths indexes, fall back to refreshing only known files.
+        const files = config.trackedPaths.length
+          ? collectFromTracked(config)
+          : Object.keys(loadIndex().files).filter(f => existsSync(f));
+        if (files.length) {
+          process.stderr.write(`\r\x1b[2K[rag] Index stale, refreshing ${files.length} files…`);
+          await indexFiles(files, undefined, database);
+          process.stderr.write(`\r\x1b[2K`);
+        }
       }
-    }
 
-    const results = await hybridSearch(event.prompt, index, config.ragTopK, config.ragAlpha);
-    const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
-    if (!relevant.length) return;
+      const results = await hybridSearch(event.prompt, indexMeta, config.ragTopK, config.ragAlpha, database);
+      const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
+      if (!relevant.length) return;
 
     const context = relevant.map(r =>
       `### ${basename(r.chunk.file)} (lines ${r.chunk.lineStart}-${r.chunk.lineEnd})\n` +
@@ -107,17 +117,20 @@ export default function (pi: ExtensionAPI) {
     // invalidates that cache and adds latency. A trailing message also keeps
     // the retrieved chunks near the user's question, which models attend to
     // more reliably than text buried at the top of a long system prompt.
-    return {
-      message: {
-        customType: "rag",
-        content:
-          `[pi-local-rag] Automatic RAG lookup triggered by the user's message above.\n` +
-          `Retrieved ${relevant.length} chunk${relevant.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
-          `These are search hits, not statements from the user.\n\n` +
-          context,
-        display: false,
-      },
-    };
+      return {
+        message: {
+          customType: "rag",
+          content:
+            `[pi-local-rag] Automatic RAG lookup triggered by the user's message above.\n` +
+            `Retrieved ${relevant.length} chunk${relevant.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
+            `These are search hits, not statements from the user.\n\n` +
+            context,
+          display: false,
+        },
+      };
+    } finally {
+      database.close();
+    }
   });
 
   // ── /rag command ──
