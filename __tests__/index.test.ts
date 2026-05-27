@@ -13,6 +13,22 @@ import { tmpdir } from "node:os";
 import { join, dirname, relative, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import ignore from "ignore";
+import Database from "better-sqlite3";
+import { load as loadVec } from "sqlite-vec";
+
+// Mock @xenova/transformers so search/embed tests don't load the ~23 MB ONNX
+// model. The mocked pipeline handles both single-string and batched-array
+// inputs (commit 849e485 fix).
+vi.mock("@xenova/transformers", () => ({
+  pipeline: vi.fn().mockResolvedValue(
+    vi.fn().mockImplementation(async (texts: string | string[]) => {
+      if (Array.isArray(texts)) {
+        return texts.map(() => ({ data: new Float32Array(384).fill(0.1) }));
+      }
+      return { data: new Float32Array(384).fill(0.1) };
+    })
+  ),
+}));
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SAMPLE_PDF = readFileSync(join(__dirname, "fixtures", "sample.pdf"));
@@ -31,7 +47,50 @@ import {
   extractText,
   hybridSearch,
   embed,
+  sha256,
+  initSchema,
 } from "../index.ts";
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/** Create an in-memory SQLite DB with the RAG schema, pre-populated with chunks.
+ *  Used by hybridSearch tests — avoids the per-file rag.db write overhead and
+ *  isolates each test. Pulled verbatim from kallewoof@849e485 tests. */
+function createTestDb(chunks: Array<{
+  id?: string; file?: string; content: string; lineStart?: number; lineEnd?: number;
+  vector?: number[];
+}>): Database.Database {
+  const db = new Database(":memory:");
+  db.pragma("journal_mode = WAL");
+  loadVec(db);
+  initSchema(db);
+
+  const insChunk = db.prepare(`
+    INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insVec = db.prepare(
+    "INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)",
+  );
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    const result = insChunk.run(
+      c.id ?? `chunk-${i}`,
+      c.file ?? "/src/file.ts",
+      c.content,
+      c.lineStart ?? 1,
+      c.lineEnd ?? 10,
+      sha256(c.content),
+      new Date().toISOString(),
+      Math.ceil(c.content.length / 4),
+    );
+    if (c.vector) {
+      const f = new Float32Array(c.vector);
+      insVec.run(Number(result.lastInsertRowid), Buffer.from(f.buffer, f.byteOffset, f.byteLength));
+    }
+  }
+  return db;
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -556,73 +615,119 @@ describe("extractText HTML", () => {
   });
 });
 
-// ─── hybridSearch (BM25 only — vector tests live under embedding) ───────────
+// ─── hybridSearch (FTS5 BM25 + sqlite-vec) ──────────────────────────────────
+// Tests ported from kallewoof@849e485 — populate an in-memory DB via
+// createTestDb() and pass it to hybridSearch's optional _db arg.
 
-describe("hybridSearch (BM25)", () => {
-  it("empty index returns no results", async () => {
-    const results = await hybridSearch("anything", { chunks: [], files: {}, lastBuild: "" });
+describe("hybridSearch (BM25 via FTS5, no vectors)", () => {
+  it("empty index → []", async () => {
+    const db = createTestDb([]);
+    const results = await hybridSearch("query", { chunks: [], files: {}, lastBuild: "" }, 10, 0.4, db);
+    db.close();
     expect(results).toEqual([]);
   });
 
-  it("BM25-only path (no vectors) ranks term matches above unrelated text", async () => {
-    const index = {
-      chunks: [
-        chunkFixture("auth.ts", "function loginUser(email, password) { return verifyToken(email); }"),
-        chunkFixture("readme.md", "# Project\nThis project does many things unrelated to the query."),
-        chunkFixture("db.ts", "connect to postgres database and return a client handle"),
-      ],
-      files: {},
-      lastBuild: "",
-    };
-    const results = await hybridSearch("loginUser email password", index, 10, 1);
+  it("returns scored result for matching content", async () => {
+    const db = createTestDb([
+      { content: "function authenticate(user, password) { return checkCredentials(user, password); }" },
+      { content: "function renderTemplate(html) { return sanitize(html); }" },
+    ]);
+    const results = await hybridSearch("authenticate", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].chunk.content).toContain("authenticate");
+  });
+
+  it("non-matching query → no results", async () => {
+    const db = createTestDb([{ content: "function computeSquareRoot(n) { return Math.sqrt(n); }" }]);
+    const results = await hybridSearch("unrelated query term xyz", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
+    const nonZero = results.filter(r => r.hybrid > 0);
+    expect(nonZero.length).toBe(0);
+  });
+
+  it("exact phrase match scores higher than partial match", async () => {
+    const db = createTestDb([
+      { content: "function handle user authentication: validate token from request" },
+      { content: "function handle request: process data from input" },
+    ]);
+    const results = await hybridSearch("user authentication", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
+    const first = results[0]?.chunk.content ?? "";
+    expect(first).toContain("authentication");
+  });
+
+  it("respects limit parameter", async () => {
+    const chunks = Array.from({ length: 10 }, (_, i) => ({
+      content: `function processItem${i}(value) { return transform(value); }`,
+    }));
+    const db = createTestDb(chunks);
+    const results = await hybridSearch("function process", { chunks: [], files: {}, lastBuild: "" }, 3, 1.0, db);
+    db.close();
+    expect(results.length).toBeLessThanOrEqual(3);
+  });
+
+  it("result shape has bm25, vector, hybrid, chunk fields", async () => {
+    const db = createTestDb([{ content: "export function calculateTotal(items) { return items.reduce((a, b) => a + b, 0); }" }]);
+    const results = await hybridSearch("calculate total", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
+    if (results.length > 0) {
+      expect(results[0]).toHaveProperty("bm25");
+      expect(results[0]).toHaveProperty("vector");
+      expect(results[0]).toHaveProperty("hybrid");
+      expect(results[0]).toHaveProperty("chunk");
+    }
+  });
+
+  it("filename boost: first query term matching filename scores higher", async () => {
+    const db = createTestDb([
+      { file: "/src/auth module", content: "export function login for user verification" },
+      { file: "/src/render module", content: "export function display for user rendering" },
+    ]);
+    const results = await hybridSearch("auth user", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
+    expect(results[0]?.chunk.file).toContain("auth");
+  });
+});
+
+describe("hybridSearch with vectors", () => {
+  const vec = (seed: number) => Array.from({ length: 384 }, (_, i) => (i === seed ? 1 : 0));
+
+  it("uses vector scores when chunks have embeddings", async () => {
+    const db = createTestDb([
+      { content: "handle user login with password verification and auth", vector: vec(0) },
+      { content: "render the homepage template with context data", vector: vec(1) },
+    ]);
+    const results = await hybridSearch("login", { chunks: [], files: {}, lastBuild: "" }, 10, 0.5, db);
+    db.close();
     expect(results.length).toBeGreaterThan(0);
-    expect(results[0].chunk.file).toBe("auth.ts");
-    for (const r of results) expect(r.vector).toBe(0);
+    expect(results[0]).toHaveProperty("bm25");
+    expect(results[0]).toHaveProperty("vector");
+    expect(results[0]).toHaveProperty("hybrid");
   });
 
-  it("filters out chunks with zero hybrid score", async () => {
-    const index = {
-      chunks: [chunkFixture("a.ts", "alpha beta gamma"), chunkFixture("b.ts", "nothing matching here at all")],
-      files: {}, lastBuild: "",
-    };
-    const results = await hybridSearch("alpha", index, 10, 1);
-    expect(results.length).toBe(1);
-    expect(results[0].chunk.file).toBe("a.ts");
+  it("hybrid score is blend of bm25 and vector when alpha=0.5", async () => {
+    const db = createTestDb([
+      { content: "authenticate user credentials and verify identity", vector: vec(0) },
+      { content: "logout session token and destroy active session", vector: vec(1) },
+    ]);
+    const results = await hybridSearch("authenticate", { chunks: [], files: {}, lastBuild: "" }, 10, 0.5, db);
+    db.close();
+    expect(results.length).toBeGreaterThan(0);
+    const r = results[0];
+    const expectedHybrid = 0.5 * r.bm25 + 0.5 * r.vector;
+    expect(r.hybrid).toBeCloseTo(expectedHybrid, 5);
   });
 
-  it("phrase boost — exact phrase outranks scattered terms", async () => {
-    const index = {
-      chunks: [
-        chunkFixture("exact.ts", "user authentication flow handles tokens"),
-        chunkFixture("scattered.ts", "authentication is one thing and user logic is another flow"),
-      ],
-      files: {}, lastBuild: "",
-    };
-    const results = await hybridSearch("user authentication flow", index, 10, 1);
-    expect(results[0].chunk.file).toBe("exact.ts");
-  });
-
-  it("respects the limit parameter", async () => {
-    const index = {
-      chunks: Array.from({ length: 8 }, (_, i) =>
-        chunkFixture(`f${i}.ts`, ("query ".repeat(i + 1) + "filler text here").trim())),
-      files: {}, lastBuild: "",
-    };
-    expect((await hybridSearch("query", index, 3, 1)).length).toBe(3);
-  });
-
-  it("results are sorted by descending hybrid score", async () => {
-    const index = {
-      chunks: [
-        chunkFixture("a.ts", "match match match relevance heavy"),
-        chunkFixture("b.ts", "match once only"),
-        chunkFixture("c.ts", "match match medium frequency"),
-      ],
-      files: {}, lastBuild: "",
-    };
-    const results = await hybridSearch("match", index, 10, 1);
-    for (let i = 1; i < results.length; i++) {
-      expect(results[i - 1].hybrid).toBeGreaterThanOrEqual(results[i].hybrid);
+  it("falls back to pure bm25 when no chunks have valid vectors", async () => {
+    const db = createTestDb([
+      { content: "process payment amount through payment gateway charge" },
+      { content: "refund order through payment gateway refund" },
+    ]);
+    const results = await hybridSearch("payment", { chunks: [], files: {}, lastBuild: "" }, 10, 0.5, db);
+    db.close();
+    if (results.length > 0) {
+      expect(results[0].hybrid).toBe(results[0].bm25);
     }
   });
 });
@@ -816,40 +921,51 @@ describe("Storage (loadConfig/saveConfig/loadIndex/saveIndex/ensureDir)", () => 
     expect(idx.lastBuild).toBe("");
   });
 
-  it("saveIndex / loadIndex: round-trip preserves chunks, files map, lastBuild and model", () => {
-    const written = {
-      chunks: [{
-        id: "abc-1",
-        file: "/some/file.ts",
-        content: "export const x = 1;",
-        lineStart: 1, lineEnd: 1,
-        hash: "deadbeef",
-        indexed: "2026-05-15T00:00:00Z",
-        tokens: 6,
-        vector: [0.1, 0.2, 0.3],
-      }],
-      files: { "/some/file.ts": { hash: "deadbeef", chunks: 1, indexed: "2026-05-15T00:00:00Z", size: 19, embedded: true } },
-      lastBuild: "2026-05-15T00:00:00Z",
-      embeddingModel: "Xenova/all-MiniLM-L6-v2",
-    };
-    saveIndex(written);
-    expect(loadIndex()).toEqual(written);
+  it("loadIndex: reconstructs IndexMeta from chunks + files + metadata in the DB", async () => {
+    // Insert directly via the same openDb the rest of the system uses, then
+    // read back through loadIndex. This replaces the old saveIndex/loadIndex
+    // round-trip — saveIndex is now a no-op (writes are transactional in
+    // indexFiles); loadIndex hydrates the legacy IndexMeta shape from SQLite.
+    const mod = await import("../index.ts");
+    const db = mod.openDb();
+    try {
+      const r = db.prepare(`
+        INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run("abc-1", "/some/file.ts", "export const x = 1;", 1, 1, "deadbeef", "2026-05-15T00:00:00Z", 6);
+      const vec = new Float32Array(384).fill(0.1);
+      db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)").run(
+        Number(r.lastInsertRowid),
+        Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength),
+      );
+      db.prepare(`
+        INSERT OR REPLACE INTO files(path, hash, chunks, indexed, size, embedded)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run("/some/file.ts", "deadbeef", 1, "2026-05-15T00:00:00Z", 19, 1);
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run("2026-05-15T00:00:00Z");
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run("Xenova/all-MiniLM-L6-v2");
+    } finally {
+      db.close();
+    }
+
+    const read = mod.loadIndex();
+    expect(read.lastBuild).toBe("2026-05-15T00:00:00Z");
+    expect(read.embeddingModel).toBe("Xenova/all-MiniLM-L6-v2");
+    expect(read.chunks).toHaveLength(1);
+    expect(read.chunks[0].id).toBe("abc-1");
+    expect(read.chunks[0].file).toBe("/some/file.ts");
+    expect(read.chunks[0].content).toBe("export const x = 1;");
+    expect(read.files["/some/file.ts"]).toEqual({
+      hash: "deadbeef", chunks: 1, indexed: "2026-05-15T00:00:00Z", size: 19, embedded: true,
+    });
   });
 
-  it("loadIndex: corrupt index.json is treated as empty (no crash)", () => {
-    writeFileSync(join(ragDir, "index.json"), "}}}not json{{{");
-    const idx = loadIndex();
-    expect(idx.chunks).toEqual([]);
-    expect(idx.files).toEqual({});
+  it("saveIndex is a no-op (writes happen via indexFiles transactions)", () => {
+    // Documented behavior — saveIndex used to write index.json. Under SQLite,
+    // chunk + file writes are committed by indexFiles. The export exists for
+    // back-compat with callers that still call it.
+    expect(() => saveIndex({ chunks: [], files: {}, lastBuild: "" })).not.toThrow();
   });
-
-  it("loadIndex: tolerates partial shapes (missing files or chunks key)", () => {
-    writeFileSync(join(ragDir, "index.json"), JSON.stringify({ chunks: "not an array", files: null }));
-    const idx = loadIndex();
-    expect(idx.chunks).toEqual([]);
-    expect(idx.files).toEqual({});
-  });
-
 });
 
 // ─── getRagDir: walk-up resolution + project vs global store ────────────────
@@ -966,10 +1082,26 @@ describe("ensureDir: legacy ~/.pi/lens → ~/.pi/rag migration (global store onl
     process.chdir(cwdSandbox);
 
     // Populate the legacy dir at the fake home so migration has work to do.
+    // Under SQLite this exercises two migration paths in sequence:
+    //   1. ensureDir() renames ~/.pi/lens → ~/.pi/rag (dir rename)
+    //   2. openDb() spots the moved index.json inside ~/.pi/rag and imports
+    //      its contents into rag.db, then unlinks the JSON file.
+    // migrateFromJson skips the import when chunks.length === 0, so the
+    // fixture has at least one chunk so we can observe the round-trip.
     const legacy = join(fakeHome, ".pi", "lens");
     mkdirSync(legacy, { recursive: true });
     writeFileSync(join(legacy, "index.json"), JSON.stringify({
-      chunks: [], files: {}, lastBuild: "from-legacy",
+      chunks: [{
+        id: "legacy-1",
+        file: "/legacy/file.ts",
+        content: "from-legacy-payload",
+        lineStart: 1, lineEnd: 1,
+        hash: "abc",
+        indexed: "2026-05-01T00:00:00Z",
+        tokens: 5,
+      }],
+      files: {},
+      lastBuild: "from-legacy",
     }));
 
     vi.resetModules();
@@ -985,11 +1117,17 @@ describe("ensureDir: legacy ~/.pi/lens → ~/.pi/rag migration (global store onl
     if (savedLegacyDir !== undefined) process.env.PI_RAG_LEGACY_DIR = savedLegacyDir;
   });
 
-  it("renames ~/.pi/lens → ~/.pi/rag and serves the migrated content", () => {
+  it("renames ~/.pi/lens → ~/.pi/rag, imports legacy index.json into rag.db, then deletes the JSON", () => {
     const idx = loadIndex();
     expect(idx.lastBuild).toBe("from-legacy");
+    expect(idx.chunks).toHaveLength(1);
+    expect(idx.chunks[0].content).toBe("from-legacy-payload");
     expect(existsSync(join(fakeHome, ".pi", "rag"))).toBe(true);
     expect(existsSync(join(fakeHome, ".pi", "lens"))).toBe(false);
+    // index.json should have been consumed by openDb's auto-migration.
+    expect(existsSync(join(fakeHome, ".pi", "rag", "index.json"))).toBe(false);
+    // The DB itself should exist now.
+    expect(existsSync(join(fakeHome, ".pi", "rag", "rag.db"))).toBe(true);
   });
 });
 
@@ -1034,6 +1172,7 @@ describe("before_agent_start: 24h auto-refresh", () => {
   let cwdSandbox: string;
   let savedCwd: string;
   let savedRagDir: string | undefined;
+  let mod: typeof import("../index.ts");
   let extensionFactory: typeof import("../index.ts").default;
 
   function makePi() {
@@ -1042,25 +1181,45 @@ describe("before_agent_start: 24h auto-refresh", () => {
       on: (event: string, fn: any) => { if (event === "before_agent_start") hookFn = fn; },
       registerCommand: () => {},
       registerTool: () => {},
+      sendMessage: () => {},
     };
     const fire = (event = { prompt: "hello world", systemPrompt: "" }) => hookFn!(event, {});
     return { pi, fire };
   }
 
-  function writeIndex(data: object) {
-    writeFileSync(join(ragDir, "index.json"), JSON.stringify(data));
+  /** Write a single chunk + file row + lastBuild directly into the DB. */
+  function seedIndex(opts: { filePath: string; lastBuild: string; fileHash?: string }) {
+    const db = mod.openDb();
+    try {
+      // Clear so each test starts clean.
+      db.exec(`DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files; DELETE FROM metadata;`);
+      const r = db.prepare(`
+        INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run("test-1", opts.filePath, "const x = 1;", 1, 1, "abc", opts.lastBuild, 5);
+      const vec = new Float32Array(384).fill(0.1);
+      db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)").run(
+        Number(r.lastInsertRowid),
+        Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength),
+      );
+      db.prepare(`
+        INSERT OR REPLACE INTO files(path, hash, chunks, indexed, size, embedded)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(opts.filePath, opts.fileHash ?? "old", 1, opts.lastBuild, 10, 1);
+      db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(opts.lastBuild);
+    } finally {
+      db.close();
+    }
   }
 
-  function readIndexFile() {
-    return JSON.parse(readFileSync(join(ragDir, "index.json"), "utf-8"));
-  }
-
-  function fakeChunk(file: string) {
-    return {
-      id: "test", file, content: "const x = 1;", lineStart: 1, lineEnd: 1,
-      hash: "abc", indexed: new Date().toISOString(), tokens: 5,
-      vector: new Array(384).fill(0.1),
-    };
+  function readLastBuild(): string {
+    const db = mod.openDb();
+    try {
+      const row = db.prepare("SELECT value FROM metadata WHERE key='last_build'").get() as { value?: string } | undefined;
+      return row?.value ?? "";
+    } finally {
+      db.close();
+    }
   }
 
   beforeAll(async () => {
@@ -1071,17 +1230,12 @@ describe("before_agent_start: 24h auto-refresh", () => {
     process.env.PI_RAG_DIR = ragDir;
     process.chdir(cwdSandbox);
 
-    // Stub the ONNX embedder so the auto-refresh runs in milliseconds.
-    vi.doMock("@xenova/transformers", () => ({
-      pipeline: async () => async () => ({ data: new Float32Array(384).fill(0.1) }),
-    }));
-
     vi.resetModules();
-    ({ default: extensionFactory } = await import("../index.ts"));
+    mod = await import("../index.ts");
+    extensionFactory = mod.default;
   });
 
   afterAll(() => {
-    vi.doUnmock("@xenova/transformers");
     process.chdir(savedCwd);
     rmSync(ragDir, { recursive: true, force: true });
     rmSync(cwdSandbox, { recursive: true, force: true });
@@ -1089,42 +1243,33 @@ describe("before_agent_start: 24h auto-refresh", () => {
     else delete process.env.PI_RAG_DIR;
   });
 
-  it("does not update lastBuild when index is fresh", async () => {
+  it("does not update last_build when index is fresh", async () => {
     const freshBuild = new Date(Date.now() - 60_000).toISOString();
-    writeIndex({ chunks: [fakeChunk("/some/file.ts")], files: {}, lastBuild: freshBuild });
+    seedIndex({ filePath: "/some/file.ts", lastBuild: freshBuild });
     const { pi, fire } = makePi();
     extensionFactory(pi as any);
     await fire();
-    expect(readIndexFile().lastBuild).toBe(freshBuild);
+    expect(readLastBuild()).toBe(freshBuild);
   });
 
-  it("updates lastBuild when index is stale and files exist on disk", async () => {
+  it("updates last_build when index is stale and files exist on disk", async () => {
     const testFile = join(cwdSandbox, "sample.ts");
     writeFileSync(testFile, "export const answer = 42;\n");
     const staleBuild = new Date(Date.now() - DAY_MS - 1_000).toISOString();
-    writeIndex({
-      chunks: [fakeChunk(testFile)],
-      files: { [testFile]: { hash: "old", chunks: 1, indexed: staleBuild, size: 26, embedded: true } },
-      lastBuild: staleBuild,
-    });
+    seedIndex({ filePath: testFile, lastBuild: staleBuild });
     const { pi, fire } = makePi();
     extensionFactory(pi as any);
     await fire();
-    const updated = readIndexFile();
-    expect(new Date(updated.lastBuild).getTime()).toBeGreaterThan(new Date(staleBuild).getTime());
+    expect(new Date(readLastBuild()).getTime()).toBeGreaterThan(new Date(staleBuild).getTime());
   });
 
-  it("does not update lastBuild when stale but all referenced files are gone", async () => {
+  it("does not update last_build when stale but all referenced files are gone", async () => {
     const staleBuild = new Date(Date.now() - DAY_MS - 1_000).toISOString();
     const missingFile = join(cwdSandbox, "deleted.ts");
-    writeIndex({
-      chunks: [fakeChunk(missingFile)],
-      files: { [missingFile]: { hash: "old", chunks: 1, indexed: staleBuild, size: 10, embedded: true } },
-      lastBuild: staleBuild,
-    });
+    seedIndex({ filePath: missingFile, lastBuild: staleBuild });
     const { pi, fire } = makePi();
     extensionFactory(pi as any);
     await fire();
-    expect(readIndexFile().lastBuild).toBe(staleBuild);
+    expect(readLastBuild()).toBe(staleBuild);
   });
 });

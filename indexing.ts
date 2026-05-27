@@ -1,14 +1,10 @@
 import { basename } from "node:path";
+import Database from "better-sqlite3";
+import { openDb, float32ToBuffer } from "./db.ts";
 import { EMBEDDING_MODEL } from "./constants.ts";
-import { loadIndex, saveIndex, type IndexMeta } from "./index-store.ts";
-import { extractText, chunkText, sha256 } from "./chunking.ts";
 import { embedBatch } from "./embed.ts";
-
-/** True when the index's `lastBuild` timestamp is older than `maxAgeMs` (default 24 h). */
-export function isIndexStale(index: IndexMeta, maxAgeMs = 24 * 60 * 60 * 1000): boolean {
-  if (!index.lastBuild) return false;
-  return Date.now() - new Date(index.lastBuild).getTime() > maxAgeMs;
-}
+import { chunkText, extractText, sha256 } from "./chunking.ts";
+import { IndexMeta } from "./db.ts";
 
 export interface ProgressCallbacks {
   onFile?: (current: number, total: number, filename: string, skipped: number) => void;
@@ -16,133 +12,202 @@ export interface ProgressCallbacks {
   onSave?: () => void;
 }
 
-/** Yield to the event loop so the TUI can re-render between heavy operations */
-export const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
+export function isIndexStale(index: IndexMeta, maxAgeMs = 24 * 60 * 60 * 1000): boolean {
+  if (!index.lastBuild) return false;
+  return Date.now() - new Date(index.lastBuild).getTime() > maxAgeMs;
+}
 
-/** Write overwriting progress line to stderr (visible in terminal even during tool calls) */
-export function stderrProgress(msg: string) {
+const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
+
+let _suppressStderr = false;
+
+function stderrProgress(msg: string) {
+  if (_suppressStderr) return;
   process.stderr.write(`\r\x1b[2K${msg}`);
 }
 
-// Bounded concurrency for Phase 1 (read + chunk + hash). Embedding stays
-// strictly sequential — the ONNX pipeline is single-threaded internally so
-// parallelizing the embed step would just thrash the runtime.
-const READ_CONCURRENCY = 32;
-
-type PendingChunk = { content: string; lineStart: number; lineEnd: number; hash: string };
-type Pending =
-  | { fp: string; name: string; skip: true }
-  | { fp: string; name: string; hash: string; size: number; rawChunks: PendingChunk[] };
+interface FileWork {
+  fp: string;
+  hash: string;
+  size: number;
+  rawChunks: { content: string; lineStart: number; lineEnd: number; hash: string }[];
+  _vectors?: number[][];
+}
 
 export async function indexFiles(
   paths: string[],
   progress?: ProgressCallbacks,
+  _db?: Database.Database
 ): Promise<{ indexed: number; chunks: number; skipped: number; durationMs: number }> {
+  const hadCallbacks = !!progress;
+  if (hadCallbacks) _suppressStderr = true;
+  const database = _db ?? openDb();
   const startMs = Date.now();
-  if (!paths.length) return { indexed: 0, chunks: 0, skipped: 0, durationMs: 0 };
-
-  const index = loadIndex();
   const total = paths.length;
 
-  // ── Phase 1: parallel read + chunk + hash (bounded to READ_CONCURRENCY)
-  // Pure I/O + CPU; no shared mutable state. Skip-check happens here too so
-  // we don't spend chunking work on unchanged files.
-  const pending: Pending[] = new Array(paths.length);
-  let cursor = 0;
-  let readDone = 0;
-
-  async function readOne(i: number): Promise<Pending> {
-    const fp = paths[i];
-    const name = basename(fp);
-    try {
-      const { text, hash, size } = await extractText(fp);
-      if (index.files[fp]?.hash === hash && index.files[fp]?.embedded) {
-        return { fp, name, skip: true };
-      }
-      const rawChunks: PendingChunk[] = chunkText(text).map(c => ({
-        content: c.content,
-        lineStart: c.lineStart,
-        lineEnd: c.lineEnd,
-        hash: sha256(c.content),
-      }));
-      return { fp, name, hash, size, rawChunks };
-    } catch {
-      // Treat unreadable / parse-failing files as skipped rather than aborting.
-      return { fp, name, skip: true };
+  try {
+    if (total === 0) {
+      return { indexed: 0, chunks: 0, skipped: 0, durationMs: Date.now() - startMs };
     }
-  }
 
-  async function readWorker() {
-    while (cursor < paths.length) {
-      const i = cursor++;
-      pending[i] = await readOne(i);
-      readDone++;
-      if (readDone % 64 === 0) {
-        stderrProgress(`reading ${readDone}/${total}…`);
+    const getFileStmt = database.prepare("SELECT hash, embedded FROM files WHERE path = ?");
+    const delChunks = database.prepare("DELETE FROM chunks WHERE file_path = ?");
+    const delVec = database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)");
+
+    // Phase 1: parallel read + chunk; DB ops on main thread
+    const CONCURRENCY = 32;
+    const YIELD_INTERVAL = 64;
+
+    interface ReadResult { fp: string; hash: string; size: number; raw: { content: string; lineStart: number; lineEnd: number }[] }
+
+    const readQueue: ReadResult[] = [];
+    let readQueueDone = false;
+    let readErrorCount = 0;
+    let resolveRead: (() => void) | null = null;
+    const notifyRead = () => { resolveRead?.(); resolveRead = null; };
+    const waitRead = () => new Promise<void>(r => { resolveRead = r; });
+
+    const workerCount = Math.min(CONCURRENCY, paths.length);
+    let pathsIdx = 0;
+    let producersDone = 0;
+    const producers: Promise<void>[] = [];
+    for (let w = 0; w < workerCount; w++) {
+      producers.push((async () => {
+        while (true) {
+          const i = pathsIdx++;
+          if (i >= paths.length) { producersDone++; if (producersDone >= workerCount) { readQueueDone = true; notifyRead(); } return; }
+          try {
+            const { text, hash, size } = await extractText(paths[i]);
+            const raw = chunkText(text);
+            readQueue.push({ fp: paths[i], hash, size, raw });
+            notifyRead();
+          } catch {
+            readErrorCount++;
+            stderrProgress(`[${i + 1}/${total}] ERROR ${basename(paths[i])}: not found or unreadable`);
+          }
+        }
+      })());
+    }
+
+    const toIndex: FileWork[] = [];
+    let skipped = 0;
+    let processedCount = 0;
+    let nextYieldAt = 0;
+
+    const drainReads = () => {
+      while (readQueue.length > 0) {
+        const r = readQueue.shift()!;
+        processedCount++;
+        const name = basename(r.fp);
+
+        const existing = getFileStmt.get(r.fp) as { hash?: string; embedded?: number } | undefined;
+        if (existing?.hash === r.hash && existing?.embedded) {
+          skipped++;
+          progress?.onFile?.(processedCount, total, name, skipped);
+          continue;
+        }
+
+        delVec.run(r.fp);
+        delChunks.run(r.fp);
+
+        const rawChunks = r.raw.map(c => ({ ...c, hash: sha256(c.content) }));
+        stderrProgress(`[${processedCount}/${total}] chunked ${name} (${rawChunks.length} chunks)`);
+        progress?.onFile?.(processedCount, total, name, skipped);
+
+        toIndex.push({ fp: r.fp, hash: r.hash, size: r.size, rawChunks });
+      }
+    };
+
+    const maybeYield = async () => {
+      if (processedCount >= nextYieldAt) {
+        nextYieldAt = processedCount + YIELD_INTERVAL;
         await yield_();
       }
+    };
+
+    while (!readQueueDone || readQueue.length > 0) {
+      drainReads();
+      if (!readQueueDone) await waitRead();
+      await maybeYield();
     }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(READ_CONCURRENCY, paths.length) }, readWorker),
-  );
-
-  // ── Phase 2: sequential embed + index update
-  let indexed = 0, chunked = 0, skipped = 0;
-  for (let i = 0; i < pending.length; i++) {
-    const p = pending[i];
-    const pct = Math.round(((i + 1) / total) * 100);
-
-    if ("skip" in p) {
-      skipped++;
-      stderrProgress(`[${i + 1}/${total}] ${pct}% skipped ${p.name}`);
-      progress?.onFile?.(i + 1, total, p.name, skipped);
-      if ((i + 1) % 64 === 0) await yield_();
-      continue;
-    }
-
-    index.chunks = index.chunks.filter(c => c.file !== p.fp);
-
-    stderrProgress(`[${i + 1}/${total}] ${pct}% embedding ${p.name} (${p.rawChunks.length} chunks)`);
-    progress?.onFile?.(i + 1, total, p.name, skipped);
+    drainReads();
     await yield_();
 
-    const vectors = await embedBatch(
-      p.rawChunks.map(c => c.content),
-      (ci) => {
-        stderrProgress(`[${i + 1}/${total}] ${pct}% ${p.name} — chunk ${ci}/${p.rawChunks.length}`);
-        progress?.onChunk?.(ci, p.rawChunks.length, p.name);
-      },
-    );
+    skipped += readErrorCount;
 
-    const fileId = sha256(p.fp);
-    const nowIso = new Date().toISOString();
-    for (let j = 0; j < p.rawChunks.length; j++) {
-      const chunk = p.rawChunks[j];
-      index.chunks.push({
-        id: `${fileId}-${chunk.lineStart}`,
-        file: p.fp,
-        content: chunk.content,
-        lineStart: chunk.lineStart,
-        lineEnd: chunk.lineEnd,
-        hash: chunk.hash,
-        indexed: nowIso,
-        tokens: Math.ceil(chunk.content.length / 4),
-        vector: vectors[j],
-      });
-      chunked++;
+    // Phase 2: embed in cross-file groups
+    const EMBED_GROUP_TARGET = 256;
+    const groupChunks: { fw: FileWork; ci: number }[] = [];
+    let globalChunkIdx = 0;
+
+    const flushGroup = async () => {
+      if (groupChunks.length === 0) return;
+      const texts = groupChunks.map(g => g.fw.rawChunks[g.ci].content);
+      const totalChunks = toIndex.reduce((s, f) => s + f.rawChunks.length, 0);
+      stderrProgress(`Embedding ${globalChunkIdx - groupChunks.length + 1}…${globalChunkIdx}/${totalChunks} chunks`);
+      await yield_();
+      const vectors = await embedBatch(texts);
+      for (let vi = 0; vi < groupChunks.length; vi++) {
+        const g = groupChunks[vi];
+        g.fw._vectors ??= new Array(g.fw.rawChunks.length);
+        g.fw._vectors[g.ci] = vectors[vi];
+      }
+      groupChunks.length = 0;
+    };
+
+    for (const fw of toIndex) {
+      for (let j = 0; j < fw.rawChunks.length; j++) {
+        groupChunks.push({ fw, ci: j });
+        globalChunkIdx++;
+        if (groupChunks.length >= EMBED_GROUP_TARGET) await flushGroup();
+      }
     }
+    await flushGroup();
 
-    index.files[p.fp] = { hash: p.hash, chunks: p.rawChunks.length, indexed: nowIso, size: p.size, embedded: true };
-    indexed++;
+    // Phase 3: insert chunks + vectors into DB
+    const insChunk = database.prepare(`
+      INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insVecRowid = database.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)");
+    const upsertFile = database.prepare(`
+      INSERT INTO files(path, hash, chunks, indexed, size, embedded)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(path) DO UPDATE SET
+        hash=excluded.hash, chunks=excluded.chunks, indexed=excluded.indexed,
+        size=excluded.size, embedded=excluded.embedded
+    `);
+
+    let chunked = 0;
+    const tx = database.transaction(() => {
+      for (const fw of toIndex) {
+        const vectors = fw._vectors;
+        for (let j = 0; j < fw.rawChunks.length; j++) {
+          const c = fw.rawChunks[j];
+          const chunkResult = insChunk.run(
+            `${sha256(fw.fp)}-${c.lineStart}`,
+            fw.fp, c.content, c.lineStart, c.lineEnd, c.hash,
+            new Date().toISOString(),
+            Math.ceil(c.content.length / 4),
+          );
+          if (vectors?.[j]) {
+            insVecRowid.run(Number(chunkResult.lastInsertRowid), float32ToBuffer(vectors[j]));
+          }
+          chunked++;
+        }
+        upsertFile.run(fw.fp, fw.hash, fw.rawChunks.length, new Date().toISOString(), fw.size, 1);
+      }
+    });
+
+    tx();
+
+    if (!hadCallbacks) process.stderr.write(`\r\x1b[2K`);
+    progress?.onSave?.();
+    database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(new Date().toISOString());
+    database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(EMBEDDING_MODEL);
+
+    return { indexed: toIndex.length, chunks: chunked, skipped, durationMs: Date.now() - startMs };
+  } finally {
+    if (hadCallbacks) _suppressStderr = false;
   }
-
-  // Clear stderr progress line
-  process.stderr.write(`\r\x1b[2K`);
-
-  progress?.onSave?.();
-  index.lastBuild = new Date().toISOString();
-  index.embeddingModel = EMBEDDING_MODEL;
-  saveIndex(index);
-  return { indexed, chunks: chunked, skipped, durationMs: Date.now() - startMs };
 }
