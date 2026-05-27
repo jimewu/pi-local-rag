@@ -1,5 +1,4 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
+import { test, expect } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,8 +20,8 @@ test("collectFiles: excludePatterns filters a top-level file", () => {
   const root = makeProj();
   try {
     const files = collectFiles(root, undefined, ["b.ts"]).map(f => f.replace(root, ""));
-    assert.ok(!files.includes("/b.ts"), "b.ts should be excluded");
-    assert.ok(files.includes("/a.ts"), "a.ts should still be collected");
+    expect(files).not.toContain("/b.ts");
+    expect(files).toContain("/a.ts");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -32,8 +31,8 @@ test("collectFiles: excludePatterns filters a whole directory subtree", () => {
   const root = makeProj();
   try {
     const files = collectFiles(root, undefined, ["gen/"]).map(f => f.replace(root, ""));
-    assert.ok(!files.some(f => f.includes("/gen/")), "everything under gen/ should be excluded");
-    assert.ok(files.includes("/src/deep.ts"));
+    expect(files.some(f => f.includes("/gen/"))).toBe(false);
+    expect(files).toContain("/src/deep.ts");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -43,8 +42,8 @@ test("collectFiles: extension glob exclude", () => {
   const root = makeProj();
   try {
     const files = collectFiles(root, undefined, ["*.html"]).map(f => f.replace(root, ""));
-    assert.ok(!files.some(f => f.endsWith(".html")));
-    assert.ok(files.some(f => f.endsWith(".ts")));
+    expect(files.some(f => f.endsWith(".html"))).toBe(false);
+    expect(files.some(f => f.endsWith(".ts"))).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -63,9 +62,9 @@ test("collectFromTracked: walks every tracked path, dedupes overlaps", () => {
       excludePatterns: [],
     };
     const files = collectFromTracked(cfg);
-    assert.equal(files.filter(f => f.endsWith("x.ts")).length, 1, "duplicate tracked path should not duplicate files");
-    assert.ok(files.some(f => f.endsWith("x.ts")));
-    assert.ok(files.some(f => f.endsWith("y.ts")));
+    expect(files.filter(f => f.endsWith("x.ts")).length, "duplicate tracked path should not duplicate files").toBe(1);
+    expect(files.some(f => f.endsWith("x.ts"))).toBe(true);
+    expect(files.some(f => f.endsWith("y.ts"))).toBe(true);
   } finally {
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });
@@ -83,7 +82,7 @@ test("collectFromTracked: silently skips non-existent tracked paths", () => {
       excludePatterns: [],
     };
     const files = collectFromTracked(cfg);
-    assert.equal(files.length, 1);
+    expect(files.length).toBe(1);
   } finally {
     rmSync(a, { recursive: true, force: true });
   }
@@ -99,29 +98,26 @@ test("collectFromTracked: applies excludePatterns per tracked root", () => {
       excludePatterns: ["gen/"],
     };
     const files = collectFromTracked(cfg);
-    assert.ok(!files.some(f => f.includes("/gen/")));
-    assert.ok(files.some(f => f.endsWith("a.ts")));
+    expect(files.some(f => f.includes("/gen/"))).toBe(false);
+    expect(files.some(f => f.endsWith("a.ts"))).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("isExcludedByConfig: false when no patterns", () => {
-  assert.equal(isExcludedByConfig("/repo/a.ts", ["/repo"], []), false);
+  expect(isExcludedByConfig("/repo/a.ts", ["/repo"], [])).toBe(false);
 });
 
 test("isExcludedByConfig: matches a file relative to a root", () => {
-  assert.equal(isExcludedByConfig("/repo/gen/x.ts", ["/repo"], ["gen/"]), true);
-  assert.equal(isExcludedByConfig("/repo/src/x.ts", ["/repo"], ["gen/"]), false);
+  expect(isExcludedByConfig("/repo/gen/x.ts", ["/repo"], ["gen/"])).toBe(true);
+  expect(isExcludedByConfig("/repo/src/x.ts", ["/repo"], ["gen/"])).toBe(false);
 });
 
 test("isExcludedByConfig: tries all roots; returns true if any matches", () => {
-  assert.equal(
-    isExcludedByConfig("/repo-b/gen/x.ts", ["/repo-a", "/repo-b"], ["gen/"]),
-    true,
-  );
+  expect(isExcludedByConfig("/repo-b/gen/x.ts", ["/repo-a", "/repo-b"], ["gen/"])).toBe(true);
 });
 
 test("isExcludedByConfig: file outside every root is not excluded", () => {
-  assert.equal(isExcludedByConfig("/elsewhere/a.ts", ["/repo"], ["*.ts"]), false);
+  expect(isExcludedByConfig("/elsewhere/a.ts", ["/repo"], ["*.ts"])).toBe(false);
 });

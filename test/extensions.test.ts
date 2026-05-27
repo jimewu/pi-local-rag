@@ -1,44 +1,43 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
+import { test, expect } from "vitest";
 import { DEFAULT_TEXT_EXTS, normalizeExt, resolveExtensions } from "../index.ts";
 
 test("normalizeExt: adds leading dot and lowercases", () => {
-  assert.equal(normalizeExt("cs"), ".cs");
-  assert.equal(normalizeExt(".CS"), ".cs");
-  assert.equal(normalizeExt("  .TeX  "), ".tex");
-  assert.equal(normalizeExt(""), "");
-  assert.equal(normalizeExt("   "), "");
+  expect(normalizeExt("cs")).toBe(".cs");
+  expect(normalizeExt(".CS")).toBe(".cs");
+  expect(normalizeExt("  .TeX  ")).toBe(".tex");
+  expect(normalizeExt("")).toBe("");
+  expect(normalizeExt("   ")).toBe("");
 });
 
 test("resolveExtensions: returns the default set when no overrides", () => {
   const exts = resolveExtensions({ extraExtensions: [], excludeExtensions: [] });
-  for (const e of DEFAULT_TEXT_EXTS) assert.ok(exts.has(e), `default ${e} missing`);
-  assert.equal(exts.size, DEFAULT_TEXT_EXTS.length);
+  for (const e of DEFAULT_TEXT_EXTS) expect(exts.has(e), `default ${e} missing`).toBe(true);
+  expect(exts.size).toBe(DEFAULT_TEXT_EXTS.length);
 });
 
 test("resolveExtensions: default set covers common languages including the ones from issue #9", () => {
   const exts = resolveExtensions({ extraExtensions: [], excludeExtensions: [] });
   for (const e of [".cs", ".tsx", ".jsx", ".kt", ".swift", ".rb", ".php", ".lua", ".vue", ".svelte"]) {
-    assert.ok(exts.has(e), `expected default set to include ${e}`);
+    expect(exts.has(e), `expected default set to include ${e}`).toBe(true);
   }
 });
 
 test("resolveExtensions: extraExtensions are added and normalized", () => {
   const exts = resolveExtensions({ extraExtensions: ["tex", ".ZIG", " .nix "], excludeExtensions: [] });
-  assert.ok(exts.has(".tex"));
-  assert.ok(exts.has(".zig"));
-  assert.ok(exts.has(".nix"));
+  expect(exts.has(".tex")).toBe(true);
+  expect(exts.has(".zig")).toBe(true);
+  expect(exts.has(".nix")).toBe(true);
 });
 
 test("resolveExtensions: excludeExtensions remove from the default set", () => {
   const exts = resolveExtensions({ extraExtensions: [], excludeExtensions: [".md", "JSON"] });
-  assert.ok(!exts.has(".md"));
-  assert.ok(!exts.has(".json"));
-  assert.ok(exts.has(".ts"));
+  expect(exts.has(".md")).toBe(false);
+  expect(exts.has(".json")).toBe(false);
+  expect(exts.has(".ts")).toBe(true);
 });
 
 test("resolveExtensions: empty/whitespace entries are ignored", () => {
   const baseline = resolveExtensions({ extraExtensions: [], excludeExtensions: [] }).size;
   const exts = resolveExtensions({ extraExtensions: ["", "   "], excludeExtensions: ["", "  "] });
-  assert.equal(exts.size, baseline);
+  expect(exts.size).toBe(baseline);
 });

@@ -1,5 +1,4 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
+import { test, expect } from "vitest";
 import { hybridSearch } from "../index.ts";
 
 function chunk(file: string, content: string, lineStart = 1) {
@@ -17,7 +16,7 @@ function chunk(file: string, content: string, lineStart = 1) {
 
 test("hybridSearch: empty index returns no results", async () => {
   const results = await hybridSearch("anything", { chunks: [], files: {}, lastBuild: "" });
-  assert.deepEqual(results, []);
+  expect(results).toEqual([]);
 });
 
 test("hybridSearch: BM25-only path (no vectors) ranks term matches above unrelated text", async () => {
@@ -31,10 +30,9 @@ test("hybridSearch: BM25-only path (no vectors) ranks term matches above unrelat
     lastBuild: "",
   };
   const results = await hybridSearch("loginUser email password", index, 10, 1);
-  assert.ok(results.length > 0, "should return at least one result");
-  assert.equal(results[0].chunk.file, "auth.ts", "best match should be the auth chunk");
-  // vector score should be 0 since no vectors are present
-  for (const r of results) assert.equal(r.vector, 0);
+  expect(results.length).toBeGreaterThan(0);
+  expect(results[0].chunk.file).toBe("auth.ts");
+  for (const r of results) expect(r.vector).toBe(0);
 });
 
 test("hybridSearch: filters out chunks with zero hybrid score", async () => {
@@ -47,8 +45,8 @@ test("hybridSearch: filters out chunks with zero hybrid score", async () => {
     lastBuild: "",
   };
   const results = await hybridSearch("alpha", index, 10, 1);
-  assert.equal(results.length, 1);
-  assert.equal(results[0].chunk.file, "a.ts");
+  expect(results.length).toBe(1);
+  expect(results[0].chunk.file).toBe("a.ts");
 });
 
 test("hybridSearch: phrase boost — exact phrase outranks scattered terms", async () => {
@@ -61,12 +59,10 @@ test("hybridSearch: phrase boost — exact phrase outranks scattered terms", asy
     lastBuild: "",
   };
   const results = await hybridSearch("user authentication flow", index, 10, 1);
-  assert.equal(results[0].chunk.file, "exact.ts");
+  expect(results[0].chunk.file).toBe("exact.ts");
 });
 
 test("hybridSearch: respects the limit parameter", async () => {
-  // Vary match counts so chunks get distinct BM25 scores; identical scores
-  // would normalize to 0 and be filtered out (documented behavior of hybridSearch).
   const index = {
     chunks: Array.from({ length: 8 }, (_, i) =>
       chunk(`f${i}.ts`, ("query ".repeat(i + 1) + "filler text here").trim())),
@@ -74,7 +70,7 @@ test("hybridSearch: respects the limit parameter", async () => {
     lastBuild: "",
   };
   const results = await hybridSearch("query", index, 3, 1);
-  assert.equal(results.length, 3);
+  expect(results.length).toBe(3);
 });
 
 test("hybridSearch: results are sorted by descending hybrid score", async () => {
@@ -89,6 +85,6 @@ test("hybridSearch: results are sorted by descending hybrid score", async () => 
   };
   const results = await hybridSearch("match", index, 10, 1);
   for (let i = 1; i < results.length; i++) {
-    assert.ok(results[i - 1].hybrid >= results[i].hybrid, "results must be sorted desc by hybrid score");
+    expect(results[i - 1].hybrid).toBeGreaterThanOrEqual(results[i].hybrid);
   }
 });

@@ -1,5 +1,4 @@
-import { test, before, after } from "node:test";
-import assert from "node:assert/strict";
+import { test, expect, afterAll } from "vitest";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,21 +17,21 @@ rmSync(legacyDir, { recursive: true, force: true });
 const mod = await import("../index.ts");
 const { loadConfig, saveConfig, loadIndex, saveIndex } = mod;
 
-after(() => {
+afterAll(() => {
   rmSync(ragDir, { recursive: true, force: true });
   rmSync(legacyDir, { recursive: true, force: true });
 });
 
 test("loadConfig: returns defaults when no config file exists", () => {
   const cfg = loadConfig();
-  assert.equal(cfg.ragEnabled, true);
-  assert.equal(cfg.ragTopK, 5);
-  assert.equal(cfg.ragScoreThreshold, 0.1);
-  assert.equal(cfg.ragAlpha, 0.4);
-  assert.deepEqual(cfg.extraExtensions, []);
-  assert.deepEqual(cfg.excludeExtensions, []);
-  assert.deepEqual(cfg.trackedPaths, []);
-  assert.deepEqual(cfg.excludePatterns, []);
+  expect(cfg.ragEnabled).toBe(true);
+  expect(cfg.ragTopK).toBe(5);
+  expect(cfg.ragScoreThreshold).toBe(0.1);
+  expect(cfg.ragAlpha).toBe(0.4);
+  expect(cfg.extraExtensions).toEqual([]);
+  expect(cfg.excludeExtensions).toEqual([]);
+  expect(cfg.trackedPaths).toEqual([]);
+  expect(cfg.excludePatterns).toEqual([]);
 });
 
 test("saveConfig / loadConfig round-trip persists every field", () => {
@@ -48,38 +47,35 @@ test("saveConfig / loadConfig round-trip persists every field", () => {
   };
   saveConfig(written);
   const read = loadConfig();
-  assert.deepEqual(read, written);
+  expect(read).toEqual(written);
 
-  // and verify it actually hit disk in the configured directory
-  assert.ok(existsSync(join(ragDir, "config.json")));
+  expect(existsSync(join(ragDir, "config.json"))).toBe(true);
   const raw = JSON.parse(readFileSync(join(ragDir, "config.json"), "utf-8"));
-  assert.deepEqual(raw, written);
+  expect(raw).toEqual(written);
 });
 
 test("loadConfig: merges saved partial config over defaults", () => {
-  // simulate a stored config that omits some fields
   mkdirSync(ragDir, { recursive: true });
   writeFileSync(join(ragDir, "config.json"), JSON.stringify({ ragTopK: 99 }));
   const cfg = loadConfig();
-  assert.equal(cfg.ragTopK, 99);
-  assert.equal(cfg.ragEnabled, true, "missing fields should fall back to defaults");
-  assert.equal(cfg.ragAlpha, 0.4, "missing fields should fall back to defaults");
+  expect(cfg.ragTopK).toBe(99);
+  expect(cfg.ragEnabled, "missing fields should fall back to defaults").toBe(true);
+  expect(cfg.ragAlpha, "missing fields should fall back to defaults").toBe(0.4);
 });
 
 test("loadConfig: malformed JSON falls back to defaults instead of throwing", () => {
   writeFileSync(join(ragDir, "config.json"), "{not valid json");
   const cfg = loadConfig();
-  assert.equal(cfg.ragEnabled, true);
-  assert.equal(cfg.ragTopK, 5);
+  expect(cfg.ragEnabled).toBe(true);
+  expect(cfg.ragTopK).toBe(5);
 });
 
 test("loadIndex: empty/missing index returns an empty IndexMeta shell", () => {
-  // clean slate
   rmSync(join(ragDir, "index.json"), { force: true });
   const idx = loadIndex();
-  assert.deepEqual(idx.chunks, []);
-  assert.deepEqual(idx.files, {});
-  assert.equal(idx.lastBuild, "");
+  expect(idx.chunks).toEqual([]);
+  expect(idx.files).toEqual({});
+  expect(idx.lastBuild).toBe("");
 });
 
 test("saveIndex / loadIndex: round-trip preserves chunks, files map, lastBuild and model", () => {
@@ -101,25 +97,24 @@ test("saveIndex / loadIndex: round-trip preserves chunks, files map, lastBuild a
   };
   saveIndex(written);
   const read = loadIndex();
-  assert.deepEqual(read, written);
+  expect(read).toEqual(written);
 });
 
 test("loadIndex: corrupt index.json is treated as empty (no crash)", () => {
   writeFileSync(join(ragDir, "index.json"), "}}}not json{{{");
   const idx = loadIndex();
-  assert.deepEqual(idx.chunks, []);
-  assert.deepEqual(idx.files, {});
+  expect(idx.chunks).toEqual([]);
+  expect(idx.files).toEqual({});
 });
 
 test("loadIndex: tolerates partial shapes (missing files or chunks key)", () => {
   writeFileSync(join(ragDir, "index.json"), JSON.stringify({ chunks: "not an array", files: null }));
   const idx = loadIndex();
-  assert.deepEqual(idx.chunks, [], "non-array chunks should become []");
-  assert.deepEqual(idx.files, {}, "null files should become {}");
+  expect(idx.chunks, "non-array chunks should become []").toEqual([]);
+  expect(idx.files, "null files should become {}").toEqual({});
 });
 
 test("ensureDir migration: legacy ~/.pi/lens → ~/.pi/rag is renamed on first use", () => {
-  // Tear down the rag dir so the migration code path runs, and create a populated legacy dir
   rmSync(ragDir, { recursive: true, force: true });
   rmSync(legacyDir, { recursive: true, force: true });
   mkdirSync(legacyDir, { recursive: true });
@@ -127,9 +122,8 @@ test("ensureDir migration: legacy ~/.pi/lens → ~/.pi/rag is renamed on first u
     chunks: [], files: {}, lastBuild: "from-legacy",
   }));
 
-  // Any call that triggers ensureDir will migrate
   const idx = loadIndex();
-  assert.equal(idx.lastBuild, "from-legacy", "data from legacy dir should be picked up after rename");
-  assert.ok(existsSync(ragDir), "rag dir should now exist");
-  assert.ok(!existsSync(legacyDir), "legacy dir should be gone (renamed)");
+  expect(idx.lastBuild, "data from legacy dir should be picked up after rename").toBe("from-legacy");
+  expect(existsSync(ragDir), "rag dir should now exist").toBe(true);
+  expect(existsSync(legacyDir), "legacy dir should be gone (renamed)").toBe(false);
 });

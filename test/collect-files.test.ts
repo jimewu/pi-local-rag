@@ -1,5 +1,4 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
+import { test, expect } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,21 +11,17 @@ function makeTree() {
   writeFileSync(join(root, "c.bin"), Buffer.from([0, 1, 2, 3]));
   writeFileSync(join(root, "image.png"), Buffer.alloc(10));
 
-  // Skipped dirs
   mkdirSync(join(root, "node_modules"));
   writeFileSync(join(root, "node_modules", "skip.ts"), "// should not be indexed");
   mkdirSync(join(root, ".git"));
   writeFileSync(join(root, ".git", "config"), "x");
 
-  // Dot-prefixed dir (should be skipped)
   mkdirSync(join(root, ".hidden"));
   writeFileSync(join(root, ".hidden", "secret.ts"), "// hidden");
 
-  // Nested allowed dir
   mkdirSync(join(root, "src"));
   writeFileSync(join(root, "src", "deep.py"), "print('hi')");
 
-  // Oversize file (> 500_000)
   writeFileSync(join(root, "huge.ts"), "x".repeat(500_001));
 
   return root;
@@ -36,14 +31,14 @@ test("collectFiles: walks dir, applies extension allowlist, skips node_modules a
   const root = makeTree();
   try {
     const files = collectFiles(root).map(f => f.replace(root, "")).sort();
-    assert.ok(files.includes("/a.ts"));
-    assert.ok(files.includes("/b.md"));
-    assert.ok(files.includes("/src/deep.py"));
-    assert.ok(!files.some(f => f.includes("node_modules")), "node_modules must be skipped");
-    assert.ok(!files.some(f => f.includes(".git")), ".git must be skipped");
-    assert.ok(!files.some(f => f.includes(".hidden")), "dot-prefixed dirs must be skipped");
-    assert.ok(!files.some(f => f.endsWith(".bin") || f.endsWith(".png")), "binary extensions not in allowlist");
-    assert.ok(!files.some(f => f.endsWith("huge.ts")), "files >= 500_000 bytes must be skipped");
+    expect(files).toContain("/a.ts");
+    expect(files).toContain("/b.md");
+    expect(files).toContain("/src/deep.py");
+    expect(files.some(f => f.includes("node_modules"))).toBe(false);
+    expect(files.some(f => f.includes(".git"))).toBe(false);
+    expect(files.some(f => f.includes(".hidden"))).toBe(false);
+    expect(files.some(f => f.endsWith(".bin") || f.endsWith(".png"))).toBe(false);
+    expect(files.some(f => f.endsWith("huge.ts"))).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -54,7 +49,7 @@ test("collectFiles: file path returns single entry when extension allowed", () =
   try {
     const fp = join(root, "single.ts");
     writeFileSync(fp, "export {};");
-    assert.deepEqual(collectFiles(fp), [fp]);
+    expect(collectFiles(fp)).toEqual([fp]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -65,14 +60,14 @@ test("collectFiles: file path returns empty when extension not allowed", () => {
   try {
     const fp = join(root, "data.bin");
     writeFileSync(fp, "x");
-    assert.deepEqual(collectFiles(fp), []);
+    expect(collectFiles(fp)).toEqual([]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("collectFiles: nonexistent path returns empty", () => {
-  assert.deepEqual(collectFiles(join(tmpdir(), "definitely-not-here-xyz-12345")), []);
+  expect(collectFiles(join(tmpdir(), "definitely-not-here-xyz-12345"))).toEqual([]);
 });
 
 test("collectFiles: picks up .pdf and .docx even without being in TEXT_EXTS", () => {
@@ -82,9 +77,9 @@ test("collectFiles: picks up .pdf and .docx even without being in TEXT_EXTS", ()
     writeFileSync(join(root, "doc.docx"), Buffer.from("PK\x03\x04 stub"));
     writeFileSync(join(root, "a.ts"), "x");
     const files = collectFiles(root).map(f => f.replace(root, "")).sort();
-    assert.ok(files.includes("/doc.pdf"), "PDF should be collected");
-    assert.ok(files.includes("/doc.docx"), "DOCX should be collected");
-    assert.ok(files.includes("/a.ts"));
+    expect(files).toContain("/doc.pdf");
+    expect(files).toContain("/doc.docx");
+    expect(files).toContain("/a.ts");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -96,8 +91,8 @@ test("collectFiles: 9 MB PDF accepted, 500 KB text rejected", () => {
     writeFileSync(join(root, "big.pdf"), Buffer.alloc(9_000_000));
     writeFileSync(join(root, "big.txt"), "x".repeat(500_000));
     const files = collectFiles(root).map(f => f.replace(root, "")).sort();
-    assert.ok(files.includes("/big.pdf"), "PDF under 10MB cap should pass");
-    assert.ok(!files.some(f => f.endsWith("big.txt")), "text file at 500KB should be rejected (>= cap)");
+    expect(files).toContain("/big.pdf");
+    expect(files.some(f => f.endsWith("big.txt"))).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -107,8 +102,7 @@ test("collectFiles: PDF over 10 MB cap is rejected", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-rag-test-"));
   try {
     writeFileSync(join(root, "huge.pdf"), Buffer.alloc(10_000_000));
-    const files = collectFiles(root);
-    assert.equal(files.length, 0, "PDF >= 10MB cap should be rejected");
+    expect(collectFiles(root).length).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -120,8 +114,8 @@ test("collectFiles: custom extension set is honored", () => {
     writeFileSync(join(root, "a.ts"), "x");
     writeFileSync(join(root, "b.cs"), "x");
     const files = collectFiles(root, new Set([".cs"]));
-    assert.equal(files.length, 1);
-    assert.ok(files[0].endsWith("b.cs"));
+    expect(files.length).toBe(1);
+    expect(files[0].endsWith("b.cs")).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

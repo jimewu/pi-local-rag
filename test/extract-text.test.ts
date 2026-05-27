@@ -1,5 +1,4 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
+import { test, expect } from "vitest";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -46,9 +45,9 @@ test("extractText: reads plain text files as utf-8", async () => {
     const fp = join(tmp, "a.txt");
     writeFileSync(fp, "hello world");
     const { text, hash, size } = await extractText(fp);
-    assert.equal(text, "hello world");
-    assert.match(hash, /^[0-9a-f]{12}$/);
-    assert.equal(size, 11);
+    expect(text).toBe("hello world");
+    expect(hash).toMatch(/^[0-9a-f]{12}$/);
+    expect(size).toBe(11);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -60,9 +59,9 @@ test("extractText: extracts text from a .pdf", async () => {
     const fp = join(tmp, "a.pdf");
     writeFileSync(fp, SAMPLE_PDF);
     const { text, hash, size } = await extractText(fp);
-    assert.ok(text.includes("RagPdfMarker"), "expected RagPdfMarker in extracted text");
-    assert.match(hash, /^[0-9a-f]{12}$/);
-    assert.equal(size, SAMPLE_PDF.length);
+    expect(text).toContain("RagPdfMarker");
+    expect(hash).toMatch(/^[0-9a-f]{12}$/);
+    expect(size).toBe(SAMPLE_PDF.length);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -74,7 +73,7 @@ test("extractText: extracts text from a .docx", async () => {
     const fp = join(tmp, "a.docx");
     writeFileSync(fp, await buildMinimalDocx("RagDocxMarker"));
     const { text } = await extractText(fp);
-    assert.ok(text.includes("RagDocxMarker"), "expected RagDocxMarker in extracted text");
+    expect(text).toContain("RagDocxMarker");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -92,15 +91,14 @@ test("extractText: silences pdfjs Warning/Info console output during PDF parse",
       if (typeof first === "string" && /^(Warning|Info|Deprecated API usage):/.test(first)) {
         leaked.push(first);
       }
-      // intentionally drop everything during the test to keep test output clean
     };
     try {
       const r = await extractText(fp);
-      assert.ok(r.text.includes("RagPdfMarker"), "text extraction must still work");
+      expect(r.text).toContain("RagPdfMarker");
     } finally {
       console.log = origLog;
     }
-    assert.equal(leaked.length, 0, `expected 0 pdfjs warnings, got ${leaked.length}: ${leaked.slice(0, 3).join(" | ")}`);
+    expect(leaked.length, `expected 0 pdfjs warnings, got ${leaked.length}: ${leaked.slice(0, 3).join(" | ")}`).toBe(0);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -113,7 +111,7 @@ test("extractText: hash is stable across reads of the same binary file (skip-on-
     writeFileSync(fp, SAMPLE_PDF);
     const a = await extractText(fp);
     const b = await extractText(fp);
-    assert.equal(a.hash, b.hash);
+    expect(a.hash).toBe(b.hash);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

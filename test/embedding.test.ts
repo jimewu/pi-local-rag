@@ -8,37 +8,33 @@
  *
  * Set SKIP_EMBEDDING_TESTS=1 to skip (e.g. in offline CI).
  */
-import { test } from "node:test";
-import assert from "node:assert/strict";
+import { test, expect } from "vitest";
 import { embed, cosineSimilarity, hybridSearch } from "../index.ts";
 
 const skip = process.env.SKIP_EMBEDDING_TESTS === "1";
 const EMBED_TIMEOUT = 120_000; // first run downloads ~23 MB model
 
-test("embed: returns a 384-dim unit-normalized vector for a single string", { skip, timeout: EMBED_TIMEOUT }, async () => {
+test.skipIf(skip)("embed: returns a 384-dim unit-normalized vector for a single string", async () => {
   const v = await embed("hello world");
-  assert.ok(Array.isArray(v));
-  assert.equal(v.length, 384, "all-MiniLM-L6-v2 produces 384-dim embeddings");
+  expect(Array.isArray(v)).toBe(true);
+  expect(v.length).toBe(384);
 
-  // The pipeline is configured with normalize: true → expect unit length
   const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
-  assert.ok(Math.abs(norm - 1) < 1e-3, `expected unit-normalized vector, got norm=${norm}`);
+  expect(Math.abs(norm - 1), `expected unit-normalized vector, got norm=${norm}`).toBeLessThan(1e-3);
 
-  // Sanity: not all zeros
-  assert.ok(v.some(x => x !== 0));
-});
+  expect(v.some(x => x !== 0)).toBe(true);
+}, EMBED_TIMEOUT);
 
-test("embed: deterministic — same input produces same output", { skip, timeout: EMBED_TIMEOUT }, async () => {
+test.skipIf(skip)("embed: deterministic — same input produces same output", async () => {
   const a = await embed("the quick brown fox jumps over the lazy dog");
   const b = await embed("the quick brown fox jumps over the lazy dog");
-  // Identical inputs should yield bit-identical vectors (model is deterministic)
-  assert.equal(a.length, b.length);
+  expect(a.length).toBe(b.length);
   for (let i = 0; i < a.length; i++) {
-    assert.ok(Math.abs(a[i] - b[i]) < 1e-6, `vectors differ at index ${i}: ${a[i]} vs ${b[i]}`);
+    expect(Math.abs(a[i] - b[i]), `vectors differ at index ${i}: ${a[i]} vs ${b[i]}`).toBeLessThan(1e-6);
   }
-});
+}, EMBED_TIMEOUT);
 
-test("embed: semantic similarity — related sentences are closer than unrelated ones", { skip, timeout: EMBED_TIMEOUT }, async () => {
+test.skipIf(skip)("embed: semantic similarity — related sentences are closer than unrelated ones", async () => {
   const cat = await embed("A cat sits on the windowsill watching birds.");
   const kitten = await embed("A small kitten is looking at sparrows through the window.");
   const finance = await embed("Quarterly revenue exceeded analyst expectations by twelve percent.");
@@ -46,14 +42,12 @@ test("embed: semantic similarity — related sentences are closer than unrelated
   const simRelated = cosineSimilarity(cat, kitten);
   const simUnrelated = cosineSimilarity(cat, finance);
 
-  assert.ok(simRelated > simUnrelated + 0.1,
-    `expected cat~kitten (${simRelated.toFixed(3)}) to clearly outscore cat~finance (${simUnrelated.toFixed(3)})`);
-  assert.ok(simRelated > 0.5, `cat~kitten cosine should be high, got ${simRelated.toFixed(3)}`);
-});
+  expect(simRelated, `expected cat~kitten (${simRelated.toFixed(3)}) to clearly outscore cat~finance (${simUnrelated.toFixed(3)})`)
+    .toBeGreaterThan(simUnrelated + 0.1);
+  expect(simRelated, `cat~kitten cosine should be high, got ${simRelated.toFixed(3)}`).toBeGreaterThan(0.5);
+}, EMBED_TIMEOUT);
 
-test("hybridSearch: vector path retrieves semantically relevant chunks even without keyword overlap", { skip, timeout: EMBED_TIMEOUT }, async () => {
-  // Build an index where the most semantically relevant chunk shares NO query keywords.
-  // BM25 alone would miss it; vector search should surface it.
+test.skipIf(skip)("hybridSearch: vector path retrieves semantically relevant chunks even without keyword overlap", async () => {
   const chunks = [
     { content: "Photosynthesis is how plants convert sunlight into chemical energy.", file: "plants.md" },
     { content: "The team shipped a new dashboard for analytics reporting.", file: "shipping.md" },
@@ -77,10 +71,9 @@ test("hybridSearch: vector path retrieves semantically relevant chunks even with
     lastBuild: "",
   };
 
-  // Query has zero keyword overlap with the plants chunk, but is semantically close.
-  // alpha=0 → pure vector search.
   const results = await hybridSearch("How do leaves produce food from light?", index, 3, 0);
-  assert.ok(results.length > 0, "vector search should return results");
-  assert.equal(results[0].chunk.file, "plants.md",
-    `expected photosynthesis chunk to rank first via semantic similarity; got ${results[0].chunk.file}`);
-});
+  expect(results.length).toBeGreaterThan(0);
+  expect(results[0].chunk.file,
+    `expected photosynthesis chunk to rank first via semantic similarity; got ${results[0].chunk.file}`)
+    .toBe("plants.md");
+}, EMBED_TIMEOUT);

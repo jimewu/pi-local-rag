@@ -16,7 +16,9 @@
   ],
   "scripts": {
     "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck",
-    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "pi-package",
@@ -66,6 +68,8 @@
     "@mariozechner/pi-coding-agent": ">=0.60.0"
   },
   "devDependencies": {
-    "jszip": "^3.10.1"
+    "@vitest/coverage-v8": "^4.1.7",
+    "jszip": "^3.10.1",
+    "vitest": "^4.1.7"
   }
 }
