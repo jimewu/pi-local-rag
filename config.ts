@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { CONFIG_FILE, ensureDir } from "./store.ts";
+import { configFile, getRagDir } from "./store.ts";
 import { DEFAULT_TEXT_EXTS } from "./constants.ts";
 
 export interface RagConfig {
@@ -22,16 +22,15 @@ export function defaultConfig(): RagConfig {
 }
 
 export function loadConfig(): RagConfig {
-  ensureDir();
-  if (!existsSync(CONFIG_FILE)) return defaultConfig();
+  const cfgFile = configFile(getRagDir());
+  if (!existsSync(cfgFile)) return defaultConfig();
   try {
-    return { ...defaultConfig(), ...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) };
+    return { ...defaultConfig(), ...JSON.parse(readFileSync(cfgFile, "utf-8")) };
   } catch { return defaultConfig(); }
 }
 
 export function saveConfig(config: RagConfig) {
-  ensureDir();
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  writeFileSync(configFile(getRagDir()), JSON.stringify(config, null, 2));
 }
 
 /** Normalize a user-supplied extension to lowercase ".ext" form. */

@@ -4,6 +4,10 @@
  * Index local files → chunk → embed → store → retrieve → inject into LLM context.
  * Uses Transformers.js (ONNX) for local embeddings — zero cloud dependency.
  *
+ * Storage is per-cwd: walk up from the working directory looking for a `.pi/rag/`
+ * project store; fall back to `~/.pi/rag/` as the global default. The first
+ * `/rag index` in a directory with no parent store creates one at cwd.
+ *
  * /rag index <path>     → index + embed a file or directory
  * /rag search <query>   → hybrid search (BM25 + vector)
  * /rag find <glob>      → list indexed files matching a glob
@@ -38,7 +42,7 @@ import { resolve, extname, basename, relative } from "node:path";
 import ignore from "ignore";
 
 import { RST, B, D, GREEN, CYAN } from "./constants.ts";
-import { RAG_DIR, ensureDir } from "./store.ts";
+import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
 import { loadIndex, saveIndex } from "./index-store.ts";
 import { collectFiles, collectFromTracked, isExcludedByConfig } from "./chunking.ts";
@@ -48,7 +52,7 @@ import { indexFiles } from "./indexing.ts";
 // Re-export the public surface so existing consumers of `pi-local-rag` keep
 // working (tests, downstream code that imports from the package root).
 export { DEFAULT_TEXT_EXTS } from "./constants.ts";
-export { RAG_DIR } from "./store.ts";
+export { getRagDir, GLOBAL_RAG_DIR, LEGACY_DIR } from "./store.ts";
 export type { RagConfig } from "./config.ts";
 export { loadConfig, saveConfig, defaultConfig, normalizeExt, resolveExtensions } from "./config.ts";
 export type { Chunk, IndexMeta } from "./index-store.ts";
@@ -63,8 +67,6 @@ export { cosineSimilarity, normalize, hybridSearch } from "./search.ts";
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  ensureDir();
-
   // ── Auto-inject RAG context before every agent turn ──
   pi.on("before_agent_start", async (event, _ctx) => {
     const config = loadConfig();
@@ -112,6 +114,8 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "index") {
         const path = parts[1] || ".";
         if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
+        // Anchor a project-local store at cwd if there isn't one in scope yet.
+        getRagDir({ createIfMissing: true });
         const config = loadConfig();
         const absPath = resolve(path);
         if (!config.trackedPaths.includes(absPath)) {
@@ -152,7 +156,9 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        ctx.ui.notify(`✅ Indexed ${result.indexed} files (${result.chunks} chunks) · ${result.skipped} unchanged · ${secs}s · tracking ${config.trackedPaths.length} path(s)`, "info");
+        const ragDir = getRagDir();
+        const scope = ragDir === GLOBAL_RAG_DIR() ? "global" : "project";
+        ctx.ui.notify(`✅ Indexed ${result.indexed} files (${result.chunks} chunks) · ${result.skipped} unchanged · ${secs}s · tracking ${config.trackedPaths.length} path(s) · ${scope} store`, "info");
         return;
       }
 
@@ -444,6 +450,8 @@ export default function (pi: ExtensionAPI) {
       const th = ctx.ui.theme;
       const label = (k: string) => th.fg("dim", k.padEnd(18));
       const val = (v: string | number) => th.fg("success", String(v));
+      const ragDir = getRagDir();
+      const scope = ragDir === GLOBAL_RAG_DIR() ? "global" : "project";
       const lines: string[] = [
         th.bold("🔍 pi-local-rag"),
         "",
@@ -453,7 +461,7 @@ export default function (pi: ExtensionAPI) {
         "  " + label("Total tokens:")   + val(totalTokens.toLocaleString()),
         "  " + label("Embedding model:") + th.fg("dim", index.embeddingModel || "none"),
         "  " + label("Last build:")     + (index.lastBuild || th.fg("dim", "never")),
-        "  " + label("Storage:")        + th.fg("dim", RAG_DIR),
+        "  " + label("Storage:")        + th.fg("dim", `${ragDir} (${scope})`),
         "",
         "  " + label("RAG injection:")  +
           (config.ragEnabled ? th.fg("success", "enabled") : th.fg("warning", "disabled")) +
@@ -498,6 +506,8 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_toolCallId, params) => {
       if (!existsSync(params.path)) return { content: [{ type: "text" as const, text: `Path not found: ${params.path}` }], details: undefined };
+      // Anchor a project-local store at cwd if there isn't one in scope yet.
+      getRagDir({ createIfMissing: true });
       const config = loadConfig();
       const absPath = resolve(params.path);
       if (!config.trackedPaths.includes(absPath)) {
@@ -555,7 +565,8 @@ export default function (pi: ExtensionAPI) {
         totalTokens: index.chunks.reduce((s, c) => s + c.tokens, 0),
         lastBuild: index.lastBuild || "never",
         ragConfig: config,
-        storagePath: RAG_DIR,
+        storagePath: getRagDir(),
+        storageScope: getRagDir() === GLOBAL_RAG_DIR() ? "global" : "project",
       }, null, 2);
       return { content: [{ type: "text" as const, text }], details: undefined };
     },
