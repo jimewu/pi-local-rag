@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from "vitest";
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync,
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, relative, basename } from "node:path";
@@ -850,16 +850,145 @@ describe("Storage (loadConfig/saveConfig/loadIndex/saveIndex/ensureDir)", () => 
     expect(idx.files).toEqual({});
   });
 
-  it("ensureDir migration: legacy ~/.pi/lens → ~/.pi/rag is renamed on first use", () => {
-    rmSync(ragDir, { recursive: true, force: true });
-    rmSync(legacyDir, { recursive: true, force: true });
-    mkdirSync(legacyDir, { recursive: true });
-    writeFileSync(join(legacyDir, "index.json"), JSON.stringify({
+});
+
+// ─── getRagDir: walk-up resolution + project vs global store ────────────────
+
+describe("getRagDir (per-project store resolution)", () => {
+  let fakeHome: string;
+  let projectRoot: string;
+  let savedCwd: string;
+  let savedHome: string | undefined;
+  let savedRagDir: string | undefined;
+  let getRagDir: typeof import("../index.ts").getRagDir;
+  let GLOBAL_RAG_DIR: typeof import("../index.ts").GLOBAL_RAG_DIR;
+
+  // macOS resolves /var/folders/... → /private/var/folders/... through symlink.
+  // mkdtempSync returns one form; process.cwd() after chdir returns the realpath.
+  // Use the resolved form everywhere for stable comparisons.
+  const resolveTmp = (p: string) => realpathSync(p);
+
+  beforeAll(async () => {
+    fakeHome = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-home-")));
+    projectRoot = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-proj-")));
+    savedCwd = process.cwd();
+    savedHome = process.env.HOME;
+    savedRagDir = process.env.PI_RAG_DIR;
+    process.env.HOME = fakeHome;
+    delete process.env.PI_RAG_DIR;
+
+    vi.resetModules();
+    ({ getRagDir, GLOBAL_RAG_DIR } = await import("../index.ts"));
+  });
+
+  afterAll(() => {
+    process.chdir(savedCwd);
+    rmSync(fakeHome, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+    if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
+    if (savedRagDir !== undefined) process.env.PI_RAG_DIR = savedRagDir;
+  });
+
+  it("$PI_RAG_DIR override wins over everything", () => {
+    const override = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-override-")));
+    process.env.PI_RAG_DIR = override;
+    try {
+      expect(getRagDir()).toBe(override);
+    } finally {
+      delete process.env.PI_RAG_DIR;
+      rmSync(override, { recursive: true, force: true });
+    }
+  });
+
+  it("returns ${cwd}/.pi/rag when one exists at cwd", () => {
+    const projectStore = join(projectRoot, ".pi", "rag");
+    mkdirSync(projectStore, { recursive: true });
+    process.chdir(projectRoot);
+    expect(getRagDir()).toBe(projectStore);
+  });
+
+  it("walks up to find a parent .pi/rag", () => {
+    const sub = join(projectRoot, "src", "deep");
+    mkdirSync(sub, { recursive: true });
+    process.chdir(sub);
+    expect(getRagDir()).toBe(join(projectRoot, ".pi", "rag"));
+  });
+
+  it("falls back to the global ~/.pi/rag when no project store is in scope", () => {
+    const isolated = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-iso-")));
+    try {
+      process.chdir(isolated);
+      const got = getRagDir();
+      expect(got).toBe(GLOBAL_RAG_DIR());
+      expect(got.startsWith(fakeHome)).toBe(true);
+    } finally {
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+
+  it("createIfMissing: anchors a new project store at cwd", () => {
+    const fresh = resolveTmp(mkdtempSync(join(tmpdir(), "pi-rag-fresh-")));
+    try {
+      process.chdir(fresh);
+      const got = getRagDir({ createIfMissing: true });
+      expect(got).toBe(join(fresh, ".pi", "rag"));
+      expect(existsSync(got)).toBe(true);
+    } finally {
+      rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+});
+
+// The legacy ~/.pi/lens → ~/.pi/rag migration now only fires when the
+// home-dir global store is in play (PI_RAG_DIR override skips it). To
+// exercise it we have to fake HOME rather than use PI_RAG_DIR.
+describe("ensureDir: legacy ~/.pi/lens → ~/.pi/rag migration (global store only)", () => {
+  let fakeHome: string;
+  let cwdSandbox: string;
+  let savedCwd: string;
+  let savedHome: string | undefined;
+  let savedRagDir: string | undefined;
+  let savedLegacyDir: string | undefined;
+  let loadIndex: typeof import("../index.ts").loadIndex;
+
+  beforeAll(async () => {
+    fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "pi-rag-home-")));
+    // chdir to an isolated path so walk-up doesn't discover the real user's
+    // ~/.pi/rag (which exists outside our fake HOME).
+    cwdSandbox = realpathSync(mkdtempSync(join(tmpdir(), "pi-rag-cwd-")));
+    savedCwd = process.cwd();
+    savedHome = process.env.HOME;
+    savedRagDir = process.env.PI_RAG_DIR;
+    savedLegacyDir = process.env.PI_RAG_LEGACY_DIR;
+    process.env.HOME = fakeHome;
+    delete process.env.PI_RAG_DIR;
+    delete process.env.PI_RAG_LEGACY_DIR;
+    process.chdir(cwdSandbox);
+
+    // Populate the legacy dir at the fake home so migration has work to do.
+    const legacy = join(fakeHome, ".pi", "lens");
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "index.json"), JSON.stringify({
       chunks: [], files: {}, lastBuild: "from-legacy",
     }));
+
+    vi.resetModules();
+    ({ loadIndex } = await import("../index.ts"));
+  });
+
+  afterAll(() => {
+    process.chdir(savedCwd);
+    rmSync(fakeHome, { recursive: true, force: true });
+    rmSync(cwdSandbox, { recursive: true, force: true });
+    if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
+    if (savedRagDir !== undefined) process.env.PI_RAG_DIR = savedRagDir;
+    if (savedLegacyDir !== undefined) process.env.PI_RAG_LEGACY_DIR = savedLegacyDir;
+  });
+
+  it("renames ~/.pi/lens → ~/.pi/rag and serves the migrated content", () => {
     const idx = loadIndex();
     expect(idx.lastBuild).toBe("from-legacy");
-    expect(existsSync(ragDir)).toBe(true);
-    expect(existsSync(legacyDir)).toBe(false);
+    expect(existsSync(join(fakeHome, ".pi", "rag"))).toBe(true);
+    expect(existsSync(join(fakeHome, ".pi", "lens"))).toBe(false);
   });
 });

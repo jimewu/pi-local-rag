@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { INDEX_FILE, ensureDir } from "./store.ts";
+import { indexFile, getRagDir } from "./store.ts";
 
 export interface Chunk {
   id: string;
@@ -21,10 +21,10 @@ export interface IndexMeta {
 }
 
 export function loadIndex(): IndexMeta {
-  ensureDir();
-  if (!existsSync(INDEX_FILE)) return { chunks: [], files: {}, lastBuild: "" };
+  const idxFile = indexFile(getRagDir());
+  if (!existsSync(idxFile)) return { chunks: [], files: {}, lastBuild: "" };
   try {
-    const data = JSON.parse(readFileSync(INDEX_FILE, "utf-8"));
+    const data = JSON.parse(readFileSync(idxFile, "utf-8"));
     return {
       chunks: Array.isArray(data.chunks) ? data.chunks : [],
       files: data.files && typeof data.files === "object" ? data.files : {},
@@ -35,6 +35,5 @@ export function loadIndex(): IndexMeta {
 }
 
 export function saveIndex(index: IndexMeta) {
-  ensureDir();
-  writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
+  writeFileSync(indexFile(getRagDir()), JSON.stringify(index, null, 2));
 }
