@@ -14,6 +14,7 @@
  * /rag ext add <.ext>   → add an extra extension (e.g. .cs, .tex)
  * /rag ext remove <.ext>→ remove an extension from the active set
  * /rag ext reset        → restore default extensions
+ * /rag help             → show all /rag commands
  *
  * Tools: rag_index, rag_query, rag_status
  */
@@ -654,6 +655,30 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "clear") {
         saveIndex({ chunks: [], files: {}, lastBuild: "" });
         ctx.ui.notify("Index cleared.", "info");
+        return;
+      }
+
+      // ── help ──
+      if (cmd === "help") {
+        const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - s.length));
+        const cmds: [string, string][] = [
+          ["/rag index <path>",       "Index a file or directory (chunks, embeds, stores)"],
+          ["/rag search <query>",     "Hybrid BM25 + vector search over the index"],
+          ["/rag status",             "Show index stats and active configuration"],
+          ["/rag rebuild",            "Re-embed all previously indexed files"],
+          ["/rag clear",              "Delete all indexed chunks"],
+          ["/rag ext list|add|remove|reset", "Manage the indexable file-extension allowlist"],
+          ["/rag on",                 "Enable automatic RAG injection before each agent turn"],
+          ["/rag off",                "Disable automatic RAG injection"],
+          ["/rag help",               "Show this help"],
+        ];
+        const COL = 36;
+        const th = ctx.ui.theme;
+        const lines: string[] = [th.bold("pi-local-rag commands"), ""];
+        for (const [usage, desc] of cmds) {
+          lines.push("  " + th.fg("success", pad(usage, COL)) + "  " + th.fg("dim", desc));
+        }
+        ctx.ui.setWidget("rag-help", lines);
         return;
       }
 
