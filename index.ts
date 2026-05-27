@@ -529,7 +529,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /rag command ──
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|find|status|rebuild|clear|on|off|ext",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild|clear|exclude|on|off|ext",
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
       const cmd = parts[0] || "status";
