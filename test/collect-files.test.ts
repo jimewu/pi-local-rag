@@ -75,6 +75,45 @@ test("collectFiles: nonexistent path returns empty", () => {
   assert.deepEqual(collectFiles(join(tmpdir(), "definitely-not-here-xyz-12345")), []);
 });
 
+test("collectFiles: picks up .pdf and .docx even without being in TEXT_EXTS", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-rag-test-"));
+  try {
+    writeFileSync(join(root, "doc.pdf"), Buffer.from("%PDF-1.4 stub"));
+    writeFileSync(join(root, "doc.docx"), Buffer.from("PK\x03\x04 stub"));
+    writeFileSync(join(root, "a.ts"), "x");
+    const files = collectFiles(root).map(f => f.replace(root, "")).sort();
+    assert.ok(files.includes("/doc.pdf"), "PDF should be collected");
+    assert.ok(files.includes("/doc.docx"), "DOCX should be collected");
+    assert.ok(files.includes("/a.ts"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("collectFiles: 9 MB PDF accepted, 500 KB text rejected", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-rag-test-"));
+  try {
+    writeFileSync(join(root, "big.pdf"), Buffer.alloc(9_000_000));
+    writeFileSync(join(root, "big.txt"), "x".repeat(500_000));
+    const files = collectFiles(root).map(f => f.replace(root, "")).sort();
+    assert.ok(files.includes("/big.pdf"), "PDF under 10MB cap should pass");
+    assert.ok(!files.some(f => f.endsWith("big.txt")), "text file at 500KB should be rejected (>= cap)");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("collectFiles: PDF over 10 MB cap is rejected", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-rag-test-"));
+  try {
+    writeFileSync(join(root, "huge.pdf"), Buffer.alloc(10_000_000));
+    const files = collectFiles(root);
+    assert.equal(files.length, 0, "PDF >= 10MB cap should be rejected");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("collectFiles: custom extension set is honored", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-rag-test-"));
   try {
