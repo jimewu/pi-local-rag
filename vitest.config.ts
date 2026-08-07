@@ -8,5 +8,13 @@ export default defineConfig({
     // shared module instance. Keep files sequential — runtime is < 1 s.
     fileParallelism: false,
     testTimeout: 10_000,
+    // The @xenova/transformers mock in index.test.ts emits 384-dim vectors
+    // (matching the original all-MiniLM-L6-v2), and the reranker is a
+    // text-classification pipeline the mock does not model — so run the test
+    // suite against those defaults.
+    env: {
+      RAG_EMBEDDING_DIM: "384",
+      RAG_RERANKER: "false",
+    },
   },
 });

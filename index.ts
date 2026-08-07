@@ -44,27 +44,39 @@ import { resolve, extname, basename, relative } from "node:path";
 import ignore from "ignore";
 
 import { RST, B, D, GREEN, CYAN } from "./constants.ts";
+import { DOC_CONVERT_EXTS } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
-import { openDb, loadIndex, saveIndex, getIndexStats } from "./db.ts";
+import { getDbConn, loadIndex, saveIndex, getIndexStats } from "./db.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
+import { scanMarkdownSync } from "./md-sync.ts";
+import { computeCoverage, coverageVerdictLabel } from "./coverage.ts";
+import { autoCompleteCoverage } from "./auto-fix.ts";
+import { isRerankerEnabled } from "./embed.ts";
 import { hybridSearch } from "./search.ts";
 import { indexFiles, isIndexStale } from "./indexing.ts";
 
 // Re-export the public surface so existing consumers of `pi-local-rag` keep
 // working (tests, downstream code that imports from the package root).
-export { DEFAULT_TEXT_EXTS } from "./constants.ts";
+export { DEFAULT_TEXT_EXTS, DEFAULT_MARKDOWN_EXTS, DOC_CONVERT_EXTS } from "./constants.ts";
 export { getRagDir, GLOBAL_RAG_DIR, LEGACY_DIR } from "./store.ts";
 export type { RagConfig } from "./config.ts";
 export { loadConfig, saveConfig, defaultConfig, normalizeExt, resolveExtensions } from "./config.ts";
 export type { Chunk, IndexMeta, IndexStats } from "./db.ts";
-export { openDb, getDb, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
-export {
-  sha256, chunkText, collectFiles, collectFilesAsync, collectFromTracked, collectFromTrackedAsync,
+export { getDbConn, closeDbConn, getFreshDbConn, loadIndex, saveIndex, getIndexStats, initSchema } from "./db.ts";
+export { RagDatabase } from "./db.ts";
+export { sha256, chunkText, chunkForFile, chunkMarkdownParentChild, splitSemanticBlocks,
+  collectFiles, collectFilesAsync, collectFromTracked, collectFromTrackedAsync,
   isExcludedByConfig, extractText, getOcrTooling, isSparsePdfText,
 } from "./chunking.ts";
-export { embed, embedBatch } from "./embed.ts";
-export type { ScoredChunk } from "./search.ts";
+export { mdTargetFor, legacyOcrTargetFor, resolveMdTarget, sha256File, readChecksumFile, scanMarkdownSync } from "./md-sync.ts";
+export type { MdSyncStatus, MdSyncReport, MdSyncState, MdSyncReason, MdTarget, MdSyncStyle } from "./md-sync.ts";
+export { computeCoverage, coverageVerdictLabel } from "./coverage.ts";
+export { autoCompleteCoverage, convertOneDocument } from "./auto-fix.ts";
+export type { AutoFixOptions, AutoFixResult, AutoFixOutcome } from "./auto-fix.ts";
+export type { CoverageReport, CoverageVerdict } from "./coverage.ts";
+export { embed, embedBatch, rerank, isRerankerEnabled } from "./embed.ts";
+export type { ScoredChunk, ParentContent } from "./search.ts";
 export { cosineSimilarity, normalize, hybridSearch } from "./search.ts";
 export { isIndexStale, indexFiles } from "./indexing.ts";
 export type { ProgressCallbacks } from "./indexing.ts";
@@ -83,14 +95,13 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    const database = openDb();
+    const database = getDbConn();
     try {
       const stats = getIndexStats(database);
       if (stats.totalChunks === 0) return;
 
-      const indexMeta = { chunks: [], files: {}, lastBuild: stats.lastBuild, embeddingModel: stats.embeddingModel };
       const now = Date.now();
-      if (isIndexStale(indexMeta) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
+      if (isIndexStale(stats) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
         lastStaleCheckMs = now;
         // Re-walk tracked paths so new files (and files of newly-supported
         // extensions, e.g. PDF/DOCX added in a later version) are picked up.
@@ -105,14 +116,21 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      const results = await hybridSearch(event.prompt, indexMeta, config.ragTopK, config.ragAlpha, database);
+      const results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha, database);
       const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
       if (!relevant.length) return;
 
-    const context = relevant.map(r =>
-      `### ${basename(r.chunk.file)} (lines ${r.chunk.lineStart}-${r.chunk.lineEnd})\n` +
-      `\`\`\`\n${r.chunk.content.slice(0, 600)}\n\`\`\``
-    ).join("\n\n");
+    // Parent-child recall: when a child belongs to a markdown section, inject
+    // the PARENT (the whole section) — the child paragraph alone would be
+    // taken out of context.
+    const context = relevant.map(r => {
+      const body = r.parent?.content ?? r.chunk.content;
+      const lineStart = r.parent?.lineStart ?? r.chunk.lineStart;
+      const lineEnd = r.parent?.lineEnd ?? r.chunk.lineEnd;
+      const section = r.parent?.heading ? ` — § ${r.parent.heading}` : "";
+      return `### ${basename(r.chunk.file)} (lines ${lineStart}-${lineEnd})${section}\n` +
+        `\`\`\`\n${body}\n\`\`\``;
+    }).join("\n\n");
 
     // Inject as a message after the user's prompt rather than appending to the
     // system prompt. The system prompt is stable across a session and benefits
@@ -132,7 +150,7 @@ export default function (pi: ExtensionAPI) {
         },
       };
     } finally {
-      database.close();
+      // getDbConn is a process-wide singleton — do not close it here.
     }
   });
 
@@ -149,6 +167,8 @@ export default function (pi: ExtensionAPI) {
     { value: "ext",      label: "ext",      description: "Manage indexable file-extension allowlist" },
     { value: "on",       label: "on",       description: "Enable auto-injection" },
     { value: "off",      label: "off",      description: "Disable auto-injection" },
+    { value: "mdsync",   label: "mdsync",   description: "Scan non-md documents for conversion state (checksum check)" },
+    { value: "coverage", label: "coverage", description: "Completeness report: indexed md vs disk, document conversion, index health" },
     { value: "help",     label: "help",     description: "Show all /rag commands" },
   ];
 
@@ -220,31 +240,117 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "search") {
         const query = parts.slice(1).join(" ");
         if (!query) { ctx.ui.notify("Usage: /rag search <query>", "warning"); return; }
-        const index = loadIndex();
         const config = loadConfig();
-        const results = await hybridSearch(query, index, 10, config.ragAlpha);
+        const database = getDbConn();
+        const results = await hybridSearch(query, 10, config.ragAlpha, database);
         if (!results.length) { ctx.ui.notify(`No results for: ${query}`, "warning"); return; }
 
         const th = ctx.ui.theme;
-        const database = openDb();
         const hasVectors = getIndexStats(database).embeddedCount > 0;
-        database.close();
         const lines: string[] = [
           th.bold(th.fg("accent", "🔍 ") + `${results.length} results for "${query}"`) +
             "  " + th.fg("dim", hasVectors ? "hybrid BM25+vector" : "BM25 only"),
           "",
         ];
         for (const r of results) {
+          const lineStart = r.parent?.lineStart ?? r.chunk.lineStart;
+          const lineEnd = r.parent?.lineEnd ?? r.chunk.lineEnd;
+          const section = r.parent?.heading ? ` — § ${r.parent.heading}` : "";
           lines.push(
             th.fg("success", basename(r.chunk.file)) +
-            th.fg("muted", `:${r.chunk.lineStart}-${r.chunk.lineEnd}`) +
-            "  " + th.fg("dim", `score=${r.hybrid.toFixed(2)}`)
+            th.fg("muted", `:${lineStart}-${lineEnd}`) +
+            section +
+            "  " + th.fg("dim", `score=${r.hybrid.toFixed(2)}${r.rerank !== undefined ? ` rerank=${r.rerank.toFixed(2)}` : ""}`)
           );
-          const preview = r.chunk.content.split("\n").slice(0, 3).join("\n");
+          const preview = (r.parent?.content ?? r.chunk.content).split("\n").slice(0, 3).join("\n");
           lines.push(th.fg("dim", preview.slice(0, 200)));
           lines.push("");
         }
         ctx.ui.setWidget("rag-search", lines);
+        return;
+      }
+
+      // ── mdsync: scan documents for markdown conversion state ──
+      if (cmd === "mdsync") {
+        const config = loadConfig();
+        const target = parts[1] ? resolve(parts[1]) : config.trackedPaths[0] ?? process.cwd();
+        if (!existsSync(target)) { ctx.ui.notify(`Path not found: ${target}`, "error"); return; }
+        const docs = collectFiles(target, DOC_CONVERT_EXTS, config.excludePatterns);
+        const report = await scanMarkdownSync(docs);
+        const th = ctx.ui.theme;
+        const lines: string[] = [
+          th.bold("📄 Markdown sync") + th.fg("dim", `  scanned ${docs.length} document(s)`),
+          "",
+          th.fg("success", `  ${report.up_to_date.length} up-to-date`),
+          th.fg("warning", `  ${report.needs_convert.length} need conversion`),
+          th.fg("muted", `  ${report.checksum_missing.length} checksum missing`),
+          "",
+        ];
+        for (const s of report.needs_convert) {
+          const rel = s.file.startsWith(process.cwd()) ? s.file.slice(process.cwd().length + 1) : s.file;
+          lines.push(th.fg("warning", `  ⚠ ${rel}`) + "  " + th.fg("dim", `→ ${s.targetMd} (${s.reason})`));
+        }
+        for (const s of report.checksum_missing) {
+          const rel = s.file.startsWith(process.cwd()) ? s.file.slice(process.cwd().length + 1) : s.file;
+          lines.push(th.fg("muted", `  ? ${rel}`) + "  " + th.fg("dim", `→ ${s.checksumFile} missing`));
+        }
+        if (docs.length === 0) lines.push(th.fg("dim", "  (no non-md documents found)"));
+        lines.push("", th.fg("dim", "Convert via the convert-documents-to-markdown skill (anydoc / batch-ocr)."));
+        ctx.ui.setWidget("rag-mdsync", lines);
+        return;
+      }
+
+      // ── coverage: completeness report (+ --auto) ──
+      if (cmd === "coverage") {
+        const config = loadConfig();
+        const auto = parts.includes("--auto");
+        const pathArg = parts.find(p => !p.startsWith("-"));
+        const target = pathArg ? resolve(pathArg) : config.trackedPaths[0] ?? process.cwd();
+        if (!existsSync(target)) { ctx.ui.notify(`Path not found: ${target}`, "error"); return; }
+
+        const env = process.env;
+        const autoOpts = {
+          excludePatterns: config.excludePatterns,
+          ocrCli: env.RAG_OCR_CLI || undefined,
+          ocrApi: env.RAG_OCR_API || undefined,
+        };
+        const report = auto
+          ? (await autoCompleteCoverage(target, autoOpts)).after
+          : await computeCoverage(target, { excludePatterns: config.excludePatterns });
+        const th = ctx.ui.theme;
+        const lines: string[] = [
+          th.bold("🧭 RAG coverage") + th.fg("dim", `  ${target}`),
+          "",
+          th.bold(report.verdict === "complete" ? th.fg("success", "✅ " + coverageVerdictLabel(report.verdict)) : th.fg("warning", coverageVerdictLabel(report.verdict))),
+          "",
+          th.fg("dim", "  Markdown:") + `  ${report.markdown.indexed}/${report.markdown.total} indexed` +
+            (report.markdown.missing.length ? th.fg("warning", `  · ${report.markdown.missing.length} missing`) : "") +
+            (report.markdown.modified.length ? th.fg("warning", `  · ${report.markdown.modified.length} modified`) : ""),
+          th.fg("dim", "  Documents:") + `  ${report.documents.total} total` +
+            th.fg("warning", `  · ${report.documents.needs_convert} needs convert`) +
+            th.fg("muted", `  · ${report.documents.checksum_missing} checksum missing`) +
+            th.fg("success", `  · ${report.documents.up_to_date} up to date`),
+          th.fg("dim", "  Index:") + `  ${report.index.chunks} chunks / ${report.index.vectors} vectors (${report.index.vectorCoveragePct}%)` +
+            (report.index.stale ? th.fg("warning", "  · STALE") : th.fg("success", "  · fresh")),
+        ];
+        if (report.markdown.missing.length) {
+          lines.push("", th.fg("warning", "  Missing md:"));
+          for (const m of report.markdown.missing.slice(0, 8)) lines.push("    " + th.fg("dim", m));
+          if (report.markdown.missing.length > 8) lines.push(th.fg("dim", `    … and ${report.markdown.missing.length - 8} more`));
+          lines.push(th.fg("dim", "  → run /rag index . (or /rag refresh)"));
+        }
+        if (report.markdown.modified.length) {
+          lines.push("", th.fg("warning", "  Modified md:"));
+          for (const m of report.markdown.modified.slice(0, 8)) lines.push("    " + th.fg("dim", m));
+          lines.push(th.fg("dim", "  → run /rag refresh"));
+        }
+        if (report.documents.needs_convert || report.documents.checksum_missing) {
+          lines.push("", th.fg("dim", "  → convert with convert-documents-to-markdown skill, then /rag mdsync"));
+        }
+        if (auto) {
+          lines.push("", th.fg("dim", "  (--auto ran: missing md indexed, checksums written, documents converted via anydoc/OCR)"));
+        }
+        ctx.ui.setWidget("rag-coverage", lines);
         return;
       }
 
@@ -263,7 +369,7 @@ export default function (pi: ExtensionAPI) {
         const rebuildArgs = parts.slice(1);
         const force = rebuildArgs.includes("--force");
 
-        const database = openDb();
+        const database = getDbConn();
         const config = loadConfig();
         try {
           const indexedRows = database.prepare("SELECT path FROM files").all() as Array<{ path: string }>;
@@ -294,13 +400,14 @@ export default function (pi: ExtensionAPI) {
           for (const f of droppedFiles) {
             database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)").run(f);
             database.prepare("DELETE FROM chunks WHERE file_path = ?").run(f);
+            database.prepare("DELETE FROM parents WHERE file_path = ?").run(f);
             database.prepare("DELETE FROM files WHERE path = ?").run(f);
           }
           if (force) {
             // --force: wipe everything and rebuild the FTS index. indexFiles
             // will then insert fresh rows for every targetFile, bypassing the
             // skip-on-equal-hash check.
-            database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
+            database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM parents; DELETE FROM files;");
             database.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
           } else {
             for (const f of targetFiles) {
@@ -356,7 +463,7 @@ export default function (pi: ExtensionAPI) {
           const secs = (result.durationMs / 1000).toFixed(1);
           ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${droppedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
         } finally {
-          database.close();
+          // getDbConn is a process-wide singleton — do not close it here.
         }
         return;
       }
@@ -560,6 +667,8 @@ export default function (pi: ExtensionAPI) {
           ["/rag ext list|add|remove|reset", "Manage the indexable file-extension allowlist"],
           ["/rag on",                 "Enable automatic RAG injection before each agent turn"],
           ["/rag off",                "Disable automatic RAG injection"],
+          ["/rag mdsync [path]",      "Scan non-md documents for markdown conversion state"],
+          ["/rag coverage [path]",    "Completeness report: indexed md vs disk, document conversion, index health"],
           ["/rag help",               "Show this help"],
         ];
         const COL = 36;
@@ -575,9 +684,8 @@ export default function (pi: ExtensionAPI) {
       // ── status (default) ──
       const index = loadIndex();
       const config = loadConfig();
-      const database = openDb();
+      const database = getDbConn();
       const stats = getIndexStats(database);
-      database.close();
       const fileCount = stats.totalFiles;
       const totalTokens = stats.totalTokens;
       const embeddedCount = stats.embeddedCount;
@@ -612,6 +720,12 @@ export default function (pi: ExtensionAPI) {
           lines.push("    " + th.fg("muted", ext) + "  " + th.fg("dim", String(count)));
         }
       }
+
+      lines.push(
+        "",
+        "  " + label("Reranker:") +
+          (isRerankerEnabled() ? th.fg("success", "enabled") : th.fg("warning", "disabled")),
+      );
 
       lines.push("", "  " + th.bold("Tracked paths:"));
       if (config.trackedPaths.length) {
@@ -667,16 +781,20 @@ export default function (pi: ExtensionAPI) {
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
     }),
     execute: async (_toolCallId, params) => {
-      const index = loadIndex();
-      if (!index.chunks.length) return { content: [{ type: "text" as const, text: "pi-local-rag index is empty. Run rag_index first." }], details: undefined };
+      const database = getDbConn();
+      const stats = getIndexStats(database);
+      if (stats.totalChunks === 0) return { content: [{ type: "text" as const, text: "pi-local-rag index is empty. Run rag_index first." }], details: undefined };
       const config = loadConfig();
-      const results = await hybridSearch(params.query, index, params.limit ?? 10, config.ragAlpha);
+      const results = await hybridSearch(params.query, params.limit ?? 10, config.ragAlpha, database);
       if (!results.length) return { content: [{ type: "text" as const, text: `No results for: ${params.query}` }], details: undefined };
       const text = JSON.stringify(results.map(r => ({
         file: r.chunk.file,
-        lines: `${r.chunk.lineStart}-${r.chunk.lineEnd}`,
+        lines: `${r.parent?.lineStart ?? r.chunk.lineStart}-${r.parent?.lineEnd ?? r.chunk.lineEnd}`,
+        section: r.parent?.heading ?? null,
+        childLines: `${r.chunk.lineStart}-${r.chunk.lineEnd}`,
         tokens: r.chunk.tokens,
-        scores: { bm25: r.bm25.toFixed(3), vector: r.vector.toFixed(3), hybrid: r.hybrid.toFixed(3) },
+        scores: { bm25: r.bm25.toFixed(3), vector: r.vector.toFixed(3), hybrid: r.hybrid.toFixed(3), rerank: r.rerank?.toFixed(3) ?? null },
+        parent: r.parent?.content ?? null,
         preview: r.chunk.content.slice(0, 300),
       })), null, 2);
       return { content: [{ type: "text" as const, text }], details: undefined };
@@ -690,9 +808,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     execute: async (_toolCallId) => {
       const config = loadConfig();
-      const database = openDb();
+      const database = getDbConn();
       const stats = getIndexStats(database);
-      database.close();
       const embeddedCount = stats.embeddedCount;
       const text = JSON.stringify({
         files: stats.totalFiles,
@@ -700,6 +817,7 @@ export default function (pi: ExtensionAPI) {
         vectorsEmbedded: embeddedCount,
         vectorCoverage: stats.totalChunks ? `${Math.round(embeddedCount / stats.totalChunks * 100)}%` : "0%",
         embeddingModel: stats.embeddingModel || "none",
+        reranker: isRerankerEnabled(),
         totalTokens: stats.totalTokens,
         lastBuild: stats.lastBuild || "never",
         ragConfig: config,
@@ -707,6 +825,67 @@ export default function (pi: ExtensionAPI) {
         storageScope: getRagDir() === GLOBAL_RAG_DIR() ? "global" : "project",
       }, null, 2);
       return { content: [{ type: "text" as const, text }], details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "rag_md_sync",
+    label: "RAG md sync",
+    description: "Scan non-markdown documents (docx/pdf/xlsx/csv/…) under a path for markdown conversion state: which need converting (no_markdown / checksum_changed) and which are up to date. The knowledge base indexes markdown only — convert missing documents with the convert-documents-to-markdown skill first, then /rag index.",
+    parameters: Type.Object({
+      path: Type.Optional(Type.String({ description: "Directory to scan (default: first tracked path, else cwd)" })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const config = loadConfig();
+      const target = params.path ? resolve(params.path) : config.trackedPaths[0] ?? process.cwd();
+      if (!existsSync(target)) return { content: [{ type: "text" as const, text: `Path not found: ${target}` }], details: undefined };
+      const docs = collectFiles(target, DOC_CONVERT_EXTS, config.excludePatterns);
+      const report = await scanMarkdownSync(docs);
+      const text = JSON.stringify({
+        scanned: docs.length,
+        summary: {
+          up_to_date: report.up_to_date.length,
+          needs_convert: report.needs_convert.length,
+          checksum_missing: report.checksum_missing.length,
+        },
+        needs_convert: report.needs_convert.map(s => ({ file: s.file, target_md: s.targetMd, reason: s.reason })),
+        checksum_missing: report.checksum_missing.map(s => ({ file: s.file, target_md: s.targetMd, checksum_file: s.checksumFile })),
+        up_to_date: report.up_to_date.map(s => s.file),
+      }, null, 2);
+      return {
+        content: [{ type: "text" as const, text }],
+        details: {
+          scanned: docs.length,
+          up_to_date: report.up_to_date.length,
+          needs_convert: report.needs_convert.length,
+          checksum_missing: report.checksum_missing.length,
+        } as Record<string, unknown>,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "rag_coverage",
+    label: "RAG coverage",
+    description: "Completeness report for the knowledge base: which markdown files on disk are not yet indexed or have changed, which non-md documents still need conversion/checksums, and whether the index is fresh and fully embedded. Run this at session start to decide whether to /rag index, /rag refresh, or convert documents.",
+    parameters: Type.Object({
+      path: Type.Optional(Type.String({ description: "Directory to scan (default: first tracked path, else cwd)" })),
+      auto: Type.Optional(Type.Boolean({ description: "When true, automatically fix gaps: index missing/changed md, write missing checksums, and convert documents (anydoc; OCR when RAG_OCR_CLI is configured)" })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const config = loadConfig();
+      const target = params.path ? resolve(params.path) : config.trackedPaths[0] ?? process.cwd();
+      if (!existsSync(target)) return { content: [{ type: "text" as const, text: `Path not found: ${target}` }], details: undefined };
+      const env = process.env;
+      const report = params.auto
+        ? (await autoCompleteCoverage(target, {
+            excludePatterns: config.excludePatterns,
+            ocrCli: env.RAG_OCR_CLI || undefined,
+            ocrApi: env.RAG_OCR_API || undefined,
+          })).after
+        : await computeCoverage(target, { excludePatterns: config.excludePatterns });
+      const text = JSON.stringify(report, null, 2);
+      return { content: [{ type: "text" as const, text }], details: { verdict: report.verdict } as Record<string, unknown> };
     },
   });
 }

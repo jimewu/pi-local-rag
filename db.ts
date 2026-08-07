@@ -13,6 +13,7 @@ export interface Chunk {
   hash: string;
   indexed: string;
   tokens: number;
+  parentId: string | null;
 }
 
 interface FileEntry {

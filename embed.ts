@@ -1,18 +1,66 @@
-import { EMBEDDING_MODEL } from "./constants.ts";
+import { EMBEDDING_MODEL, RERANKER_MODEL, RERANKER_ENABLED, EMBED_MAX_LENGTH, EMBED_BATCH_SIZE } from "./constants.ts";
 
-let _pipeline: any = null;
+// The feature-extraction PIPELINE ignores a `max_length` option (it only
+// passes padding/truncation to the tokenizer, which then truncates to the
+// model's full max position — 8192 for bge-m3). At batch 32/64 that tries to
+// allocate a ~256 GB attention buffer and the process gets OOM-killed. So we
+// drive the tokenizer + AutoModel directly (same path the reranker uses) and
+// clamp the sequence length ourselves. Mean pooling + L2 normalize matches
+// the pipeline's default pooling behavior for sentence embeddings.
+
+let _embedder: { tokenizer: any; model: any } | null = null;
+let _embedderLoading: Promise<{ tokenizer: any; model: any }> | null = null;
 
 async function getEmbedder() {
-  if (_pipeline) return _pipeline;
-  const { pipeline } = await import("@xenova/transformers");
-  _pipeline = await pipeline("feature-extraction", EMBEDDING_MODEL);
-  return _pipeline;
+  if (_embedder) return _embedder;
+  if (_embedderLoading) return _embedderLoading;
+  const { AutoTokenizer, AutoModel } = await import("@xenova/transformers");
+  _embedderLoading = (async () => {
+    const tokenizer = await AutoTokenizer.from_pretrained(EMBEDDING_MODEL);
+    const model = await AutoModel.from_pretrained(EMBEDDING_MODEL);
+    _embedder = { tokenizer, model };
+    return _embedder;
+  })().finally(() => { _embedderLoading = null; });
+  return _embedderLoading;
+}
+
+/** Embed a batch of texts: tokenize (clamped length) → forward → mean-pool
+ *  over non-padding tokens → L2 normalize. Returns number[][] (dim = model dim). */
+export async function embedTexts(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) return [];
+  const { tokenizer, model } = await getEmbedder();
+  const inputs = tokenizer(texts, { padding: true, truncation: true, max_length: EMBED_MAX_LENGTH });
+  const outputs = await model(inputs);
+  const hidden = outputs.last_hidden_state; // [batch, seq, dim]
+  const dims = hidden.dims as number[];
+  const batch = dims[0], seq = dims[1], dim = dims[2];
+  const data = hidden.data as Float32Array;
+  const mask = inputs.attention_mask?.data as Float32Array | undefined;
+
+  const vectors: number[][] = new Array(batch);
+  for (let b = 0; b < batch; b++) {
+    const vec = new Float32Array(dim);
+    let count = 0;
+    for (let s = 0; s < seq; s++) {
+      if (mask && mask[b * seq + s] === 0) continue;
+      count++;
+      const base = (b * seq + s) * dim;
+      for (let d = 0; d < dim; d++) vec[d] += data[base + d];
+    }
+    if (count === 0) count = 1;
+    let norm = 0;
+    for (let d = 0; d < dim; d++) { vec[d] /= count; norm += vec[d] * vec[d]; }
+    norm = Math.sqrt(norm) || 1;
+    const out = new Array<number>(dim);
+    for (let d = 0; d < dim; d++) out[d] = vec[d] / norm;
+    vectors[b] = out;
+  }
+  return vectors;
 }
 
 export async function embed(text: string): Promise<number[]> {
-  const embedder = await getEmbedder();
-  const output = await embedder(text, { pooling: "mean", normalize: true });
-  return Array.from(output.data as Float32Array);
+  const [v] = await embedTexts([text]);
+  return v;
 }
 
 /**
@@ -22,14 +70,14 @@ export async function embed(text: string): Promise<number[]> {
  */
 const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
 
-/** Default batch size for a single ONNX forward pass. */
-export const BATCH_SIZE = 64;
+/** Default batch size for a single ONNX forward pass (env-tunable). */
+export const BATCH_SIZE = EMBED_BATCH_SIZE;
 
 /**
  * Embed `texts` using true batched ONNX inference.
  *
  * The model is called once per batch of up to `BATCH_SIZE` texts rather than
- * once per text, giving a ~BATCH_SIZE× speedup on CPU.  The output Tensor has
+ * once per text, giving a ~BATCH_SIZE× speedup on CPU.  The output has
  * dims [batchSize, VECTOR_DIM]; we slice it into per-text arrays.
  *
  * `onProgress` is fired after each batch with the cumulative count so the TUI
@@ -40,25 +88,91 @@ export async function embedBatch(
   onProgress?: (i: number, total: number) => void,
 ): Promise<number[][]> {
   if (texts.length === 0) return [];
-  const embedder = await getEmbedder();
   const results: number[][] = new Array(texts.length);
 
   for (let start = 0; start < texts.length; start += BATCH_SIZE) {
     const batch = texts.slice(start, start + BATCH_SIZE);
-    // Pass the whole batch in a single forward pass — the model returns a
-    // Tensor with dims [batchSize, VECTOR_DIM].
-    const output = await embedder(batch, { pooling: "mean", normalize: true });
-    const flat = output.data as Float32Array;
-    const dim = flat.length / batch.length; // should equal VECTOR_DIM (384)
-
+    const embedded = await embedTexts(batch);
     for (let j = 0; j < batch.length; j++) {
-      results[start + j] = Array.from(flat.subarray(j * dim, (j + 1) * dim));
+      results[start + j] = embedded[j];
     }
-
     onProgress?.(Math.min(start + batch.length, texts.length), texts.length);
     // Yield after each batch so the TUI can re-render before the next pass.
     await yield_();
   }
 
   return results;
+}
+
+// ─── Reranker (cross-encoder) ────────────────────────────────────────────────
+//
+// Optional second stage: hybrid BM25+vector produces top-K candidates from
+// children; the reranker scores (query, parent-content) pairs with a
+// cross-encoder and re-sorts. Disabled when RAG_RERANKER=false.
+//
+// Implementation note: the text-classification pipeline in @xenova/transformers
+// does NOT accept {text, text_pair} object inputs (it only splits strings), so
+// we drive the tokenizer + AutoModelForSequenceClassification directly with the
+// tokenizer's text_pair option (same path QuestionAnsweringPipeline uses).
+
+let _reranker: { tokenizer: any; model: any } | null = null;
+let _rerankerLoading: Promise<{ tokenizer: any; model: any } | null> | null = null;
+
+export function isRerankerEnabled(): boolean {
+  return RERANKER_ENABLED;
+}
+
+async function getReranker() {
+  if (!RERANKER_ENABLED) return null;
+  if (_reranker) return _reranker;
+  if (_rerankerLoading) return _rerankerLoading;
+  const { AutoTokenizer, AutoModelForSequenceClassification } = await import("@xenova/transformers");
+  _rerankerLoading = (async () => {
+    const tokenizer = await AutoTokenizer.from_pretrained(RERANKER_MODEL);
+    const model = await AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL);
+    _reranker = { tokenizer, model };
+    return _reranker;
+  })().finally(() => { _rerankerLoading = null; });
+  return _rerankerLoading;
+}
+
+/**
+ * Cross-encoder rerank of (query, passage) pairs. Returns scores aligned with
+ * `passages` (higher = more relevant), or null when the reranker is disabled
+ * or unavailable. Accepts an injected scorer so tests can fake the model.
+ */
+export async function rerank(
+  query: string,
+  passages: string[],
+  scorer?: (pairs: Array<{ text: string; text_pair: string }>) => Promise<Array<{ score: number }>>,
+): Promise<number[] | null> {
+  if (passages.length === 0) return [];
+
+  if (scorer) {
+    const pairs = passages.map(p => ({ text: query, text_pair: p }));
+    const outputs = await scorer(pairs);
+    return outputs.map(o => Math.min(1, Math.max(0, typeof o?.score === "number" ? o.score : 0)));
+  }
+
+  const rr = await getReranker();
+  if (!rr) return null;
+  const { tokenizer, model } = rr;
+
+  const queries = new Array(passages.length).fill(query);
+  const inputs = tokenizer(queries, { text_pair: passages, padding: true, truncation: true });
+  const outputs = await model(inputs);
+  const logits = outputs.logits; // Tensor [batch, num_labels]
+  const dims = logits.dims as number[];
+  const data = logits.data as Float32Array;
+  const numLabels = dims && dims.length >= 2 ? dims[dims.length - 1] : 1;
+  const stride = Math.max(1, numLabels);
+  const scores: number[] = [];
+  for (let i = 0; i < passages.length; i++) {
+    // Single-label rerankers expose one logit; binary expose the positive
+    // class at index 1. Either way sigmoid → 0..1 relevance.
+    const idx = stride === 1 ? 0 : Math.min(1, stride - 1);
+    const logit = data[i * stride + idx] ?? 0;
+    scores.push(1 / (1 + Math.exp(-logit)));
+  }
+  return scores;
 }

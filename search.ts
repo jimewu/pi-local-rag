@@ -1,14 +1,27 @@
 import Database from "better-sqlite3";
-import { embed } from "./embed.ts";
+import { embed, rerank, isRerankerEnabled } from "./embed.ts";
 import { getDbConn } from "./db.ts";
-import { Chunk } from "./db.ts";
+import type { Chunk } from "./db.ts";
+import { RERANK_TOP_K } from "./constants.ts";
 import * as repo from "./repository.ts";
+
+export interface ParentContent {
+  id: string;
+  content: string;
+  lineStart: number;
+  lineEnd: number;
+  heading: string | null;
+}
 
 export interface ScoredChunk {
   chunk: Chunk;
   bm25: number;
   vector: number;
   hybrid: number;
+  /** Recalled parent section when the child belongs to a markdown section. */
+  parent?: ParentContent | null;
+  /** Cross-encoder rerank score when the reranker ran (0..1). */
+  rerank?: number;
 }
 
 export function cosineSimilarity(a: number[], b: number[]): number {
@@ -36,7 +49,10 @@ function l2ToCosine(l2Dist: number): number {
 }
 
 /**
- * Hybrid search using SQLite FTS5 (BM25) + sqlite-vec (vector).
+ * Hybrid search over CHILD chunks (BM25 via FTS5 trigram + sqlite-vec cosine),
+ * then recalls the PARENT section for each hit (so answers are never taken
+ * out of context) and optionally re-sorts the candidates with a cross-encoder
+ * reranker (bge-reranker by default; disable via RAG_RERANKER=false).
  */
 export async function hybridSearch(
   query: string,
@@ -125,13 +141,13 @@ export async function hybridSearch(
     const bm25Norm = bm25NormMap.get(rowid) ?? 0;
     const vecNorm = vecNormMap.get(rowid) ?? 0;
 
-      let bm25Final = bm25Norm;
-      // Boost when the first meaningful query term appears in the file path.
-      // Guard on terms[0]: an empty/short query makes includes("") always true,
-      // which would spuriously boost every result.
-      if (terms[0] && c.file_path.toLowerCase().includes(terms[0])) {
-        bm25Final = Math.min(1, bm25Final * 1.5);
-      }
+    let bm25Final = bm25Norm;
+    // Boost when the first meaningful query term appears in the file path.
+    // Guard on terms[0]: an empty/short query makes includes("") always true,
+    // which would spuriously boost every result.
+    if (terms[0] && c.file_path.toLowerCase().includes(terms[0])) {
+      bm25Final = Math.min(1, bm25Final * 1.5);
+    }
 
     const hybrid = hasVectors
       ? alpha * bm25Final + (1 - alpha) * vecNorm
@@ -142,13 +158,51 @@ export async function hybridSearch(
         id: c.id, file: c.file_path, content: c.chunk_content,
         lineStart: c.line_start, lineEnd: c.line_end,
         hash: c.chunk_hash, indexed: c.indexed_at, tokens: c.tokens,
+        parentId: c.parent_id,
       },
       bm25: bm25Final, vector: vecNorm, hybrid,
     });
   }
 
-  return scored
+  const filtered = scored
     .filter(s => s.hybrid > 0)
-    .sort((a, b) => b.hybrid - a.hybrid)
-    .slice(0, limit);
+    .sort((a, b) => b.hybrid - a.hybrid);
+
+  if (filtered.length === 0) return [];
+
+  // ── Parent recall ─────────────────────────────────────────────────────────
+  // Every child that belongs to a markdown section carries a parent_id. Load
+  // the parent (the whole section) so callers can present it as the answer
+  // body instead of a decontextualized paragraph.
+  const parentIds = new Set<string>();
+  for (const s of filtered) {
+    if (s.chunk.parentId) parentIds.add(s.chunk.parentId);
+  }
+  const parents = parentIds.size
+    ? repo.getParentsByRowids(database, Array.from(parentIds))
+    : [];
+  const parentMap = new Map(parents.map(p => [p.id, p]));
+  for (const s of filtered) {
+    const pid = s.chunk.parentId;
+    const p = pid ? parentMap.get(pid) : undefined;
+    s.parent = p
+      ? { id: p.id, content: p.content, lineStart: p.line_start, lineEnd: p.line_end, heading: p.heading }
+      : null;
+  }
+
+  // ── Rerank (optional cross-encoder) ──────────────────────────────────────
+  if (isRerankerEnabled()) {
+    const candidates = filtered.slice(0, RERANK_TOP_K);
+    const passages = candidates.map(c => c.parent?.content ?? c.chunk.content);
+    const scores = await rerank(query, passages);
+    if (scores) {
+      for (let i = 0; i < candidates.length; i++) {
+        candidates[i].rerank = scores[i];
+      }
+      candidates.sort((a, b) => (b.rerank ?? 0) - (a.rerank ?? 0));
+      return candidates.slice(0, limit);
+    }
+  }
+
+  return filtered.slice(0, limit);
 }

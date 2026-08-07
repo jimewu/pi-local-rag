@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.2
+
+- **`/rag coverage --auto`** (and `rag_coverage(auto: true)`): when the report is not complete, auto-fixes gaps in priority order — write missing checksums (trusts existing md), convert documents via anydoc (OCR CLI fallback for scanned PDFs when `RAG_OCR_CLI`/`RAG_OCR_API` are set), then re-index everything (hash-skip makes the full walk cheap). `convertOneDocument` never throws; command runner injectable for tests. Verified live: 3 docs (xlsx/pdf/csv) converted + checksummed, verdict went `needs_convert → complete`.
+
+## 0.5.1
+
+- **`rag_coverage`** (`/rag coverage` + tool): one-command knowledge-base completeness report — markdown vs index (missing/modified), non-md document conversion state (md-sync), index health (vector coverage, 24 h staleness). Verdict priority: `needs_convert` > `needs_checksum` > `needs_index` > `stale` > `complete`. 5 new tests.
+
+## 0.5.0 (jimewu fork)
+
+- **Markdown-only knowledge base**: the index allowlist is markdown only (`.md`/`.markdown`). Non-md documents are no longer ingested directly; they are converted to markdown first via the `convert-documents-to-markdown` skill, with conversion state verified by the new md-sync scanner.
+- **md-sync scanner** (`md-sync.ts`, `/rag mdsync`, `rag_md_sync` tool): for every non-md document, checks whether `A/B/B.md` (or the legacy `<stem>_ocr/<stem>.md` layout) exists and whether the recorded sha256 sidecar (`A/B/B.docx.sha256`) matches the live source. Reports `up_to_date` / `needs_convert` (`no_markdown` / `checksum_changed`) / `checksum_missing`. Symlinked duplicates (legacy `_ocr` folders) are collapsed by realpath.
+- **Configurable multilingual embeddings**: `RAG_EMBEDDING_MODEL` (default `Xenova/bge-m3`, 1024-dim) + `RAG_EMBEDDING_DIM`. Embeddings drive `AutoTokenizer + AutoModel` directly (mean pooling + L2 normalize).
+- **Sequence-length clamp** (`RAG_EMBED_MAX_LENGTH`, default 512): the feature-extraction pipeline ignores `max_length`, and bge-m3's 8192-position × batch 32 forward pass OOMs (~256 GB attention buffer). Clamping keeps peak RSS ~2 GB.
+- **Optional cross-encoder reranker** (`RAG_RERANKER`, `RAG_RERANKER_MODEL` default `Xenova/bge-reranker-base`, `RAG_RERANK_TOP_K`): re-scores (query, parent-section) pairs and re-sorts. The text-classification pipeline cannot take `{text, text_pair}`, so the reranker also drives tokenizer + `AutoModelForSequenceClassification` directly.
+- **Parent-child chunking**: markdown heading sections become parents (≤200 lines), paragraphs/lists/tables/code blocks become children; a child hit recalls the whole parent section. Heading lines never become children; `MIN_CHILD_CHARS` lowered to 10 for CJK.
+- **FTS5 `tokenize=trigram`**: CJK 3-gram segmentation replaces the default `unicode61` (which treats a run of Chinese characters as a single token, silently breaking Chinese keyword search). Schema v2 migration drops/rebuilds the FTS and vector tables and marks files for re-embedding.
+- **Fixes upstream's unfinished refactor**: `openDb`/`getDb`/`float32ToBuffer` no longer exist in `db.ts`; index.ts now uses the `getDbConn()` singleton, the `hybridSearch(query, limit, alpha, db)` signature, and re-exports `getFreshDbConn`/`initSchema`. Upstream main did not typecheck; this fork does.
+- **`/rag status`** shows the embedding model and reranker state; `rag_query` returns the recalled parent section plus child line numbers and rerank score.
+- **Testing**: 128 tests (127 passed + 1 skipped) incl. real bge-m3 ONNX suite, CJK trigram retrieval, parent recall, rerank scoring, and md-sync scanner.
+
 ## 0.4.1
 
 - **Docs refresh**: README rewritten for 0.4.0 feature set — SQLite/FTS5/sqlite-vec storage, PDF/DOCX/HTML extraction, OCR fallback, per-project store, tracked paths + exclude patterns, 24 h auto-refresh, trailing-message auto-injection. Commands table expanded with `/rag find`, `/rag refresh`, `/rag rebuild --force`, `/rag exclude`, `/rag help`. Optional OCR install instructions (`brew install poppler tesseract tesseract-lang` / `apt install poppler-utils tesseract-ocr ...`). New "Testing" section noting `SKIP_EMBEDDING_TESTS` and the tesseract-absent OCR skip.

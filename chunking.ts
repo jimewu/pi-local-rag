@@ -33,6 +33,205 @@ export function chunkText(text: string, maxLines = 50): { content: string; lineS
   return chunks;
 }
 
+// ─── Parent-child chunking (markdown) ────────────────────────────────────────
+//
+// The OCR'd case files (committee letters, review comments, …) are markdown with
+// clear heading structure. Flat line-based chunking splits sections apart and
+// mixes unrelated sections into one chunk. Instead:
+//
+//   parent  = one markdown heading section (the whole section)
+//   child   = one semantic unit inside the section (a paragraph / list /
+//             table / code block)
+//
+// Retrieval runs against CHILDREN (precise, small, embeddable). When a child
+// hits, the PARENT (the entire section) is recalled so the answer is never
+// taken out of context. Non-markdown files keep the flat chunkText path.
+
+const HEADING_RE = /^#{1,6}\s+.+$/;
+const CODE_FENCE_RE = /^\s*(```|~~~)/;
+const CHILD_MAX_LINES = 50;
+const PARENT_MAX_LINES = 200;
+// Chinese text is information-dense: a 10-character line is already a complete
+// sentence, so keep the minimum much lower than the English default.
+const MIN_CHILD_CHARS = 10;
+
+export interface ParentBlock {
+  /** Full section content (heading line included). */
+  content: string;
+  lineStart: number;
+  lineEnd: number;
+  /** Heading text without the leading `#`, or null for preamble / flat docs. */
+  heading: string | null;
+}
+
+export interface ChildBlock {
+  content: string;
+  lineStart: number;
+  lineEnd: number;
+  /** Index into the document's parents array; null for flat (non-md) files. */
+  parent: number | null;
+}
+
+export interface ChunkedDoc {
+  parents: ParentBlock[];
+  children: ChildBlock[];
+}
+
+export function isMarkdownPath(fp: string): boolean {
+  return /\.(md|mdx|markdown)$/i.test(fp);
+}
+
+/** Split section body lines into semantic blocks (paragraphs / lists /
+ *  tables / code fences), using blank lines as paragraph separators and
+ *  keeping fenced code blocks intact even when they contain blank lines. */
+export function splitSemanticBlocks(lines: string[], startLine = 0): { content: string; lineStart: number; lineEnd: number }[] {
+  const blocks: { content: string; lineStart: number; lineEnd: number }[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const trim = lines[i].trim();
+    if (trim === "") { i++; continue; }
+
+    // Fenced code block — swallow everything up to the closing fence.
+    if (CODE_FENCE_RE.test(lines[i])) {
+      const start = i;
+      i++;
+      while (i < lines.length && !CODE_FENCE_RE.test(lines[i])) i++;
+      i = Math.min(i + 1, lines.length); // include closing fence if present
+      blocks.push({
+        content: lines.slice(start, i).join("\n"),
+        lineStart: startLine + start + 1,
+        lineEnd: startLine + i,
+      });
+      continue;
+    }
+
+    // Ordinary block — accumulate consecutive non-blank lines.
+    const start = i;
+    while (i < lines.length && lines[i].trim() !== "") i++;
+    const raw = lines.slice(start, i);
+    // Oversized block (no blank lines for a long stretch): split on lines.
+    for (let s = 0; s < raw.length; s += CHILD_MAX_LINES) {
+      const e = Math.min(s + CHILD_MAX_LINES, raw.length);
+      blocks.push({
+        content: raw.slice(s, e).join("\n"),
+        lineStart: startLine + start + s + 1,
+        lineEnd: startLine + start + e,
+      });
+    }
+    while (i < lines.length && lines[i].trim() === "") i++;
+  }
+  return blocks;
+}
+
+/**
+ * Parent-child chunk a markdown document.
+ *
+ * Sections start at every ATX heading; content before the first heading is a
+ * preamble parent (heading = null). A section larger than PARENT_MAX_LINES is
+ * split into multiple parents (packed on child boundaries) so recalling a
+ * parent never floods the context window.
+ */
+export function chunkMarkdownParentChild(text: string): ChunkedDoc {
+  const lines = text.split("\n");
+  const parents: ParentBlock[] = [];
+  const children: ChildBlock[] = [];
+
+  const headingIdx: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (HEADING_RE.test(lines[i])) headingIdx.push(i);
+  }
+
+  const sectionBounds: Array<{ start: number; end: number; heading: string | null }> = [];
+  if (headingIdx.length === 0) {
+    // No headings at all — treat the whole doc as one (heading-less) section.
+    sectionBounds.push({ start: 0, end: lines.length, heading: null });
+  } else {
+    sectionBounds.push({ start: 0, end: headingIdx[0], heading: null }); // preamble
+    for (let h = 0; h < headingIdx.length; h++) {
+      sectionBounds.push({
+        start: headingIdx[h],
+        end: h + 1 < headingIdx.length ? headingIdx[h + 1] : lines.length,
+        heading: lines[headingIdx[h]].replace(/^#{1,6}\s+/, "").trim(),
+      });
+    }
+  }
+
+  for (const sec of sectionBounds) {
+    if (sec.end <= sec.start) continue; // empty preamble / adjacent headings
+    const sectionLines = lines.slice(sec.start, sec.end);
+    // Heading lines belong to the PARENT, never to a child block — a heading
+    // alone is not a searchable semantic unit.
+    const blocks = splitSemanticBlocks(sectionLines, sec.start)
+      .filter(b => !HEADING_RE.test(b.content.trim()));
+
+    // Pack blocks into parents of at most PARENT_MAX_LINES. The first pack
+    // starts at the section's heading line so the parent carries the title;
+    // the last pack runs to the section end.
+    const packs: { blocks: typeof blocks; lineStart: number; lineEnd: number }[] = [];
+    for (const b of blocks) {
+      let pack = packs[packs.length - 1];
+      if (!pack || (b.lineEnd - pack.lineStart) >= PARENT_MAX_LINES) {
+        pack = { blocks: [], lineStart: b.lineStart, lineEnd: b.lineEnd };
+        packs.push(pack);
+      }
+      pack.blocks.push(b);
+      pack.lineEnd = b.lineEnd;
+    }
+
+    if (packs.length === 0) {
+      // Heading-only section — keep the heading lines so the section is not
+      // lost entirely.
+      packs.push({ blocks: [], lineStart: sec.start + 1, lineEnd: sec.end });
+    }
+
+    for (let p = 0; p < packs.length; p++) {
+      const pack = packs[p];
+      const parentStart0 = p === 0 ? sec.start : pack.lineStart - 1; // 0-based line
+      const parentEnd0 = p === packs.length - 1 ? sec.end : pack.lineEnd; // exclusive
+      parents.push({
+        content: lines.slice(parentStart0, parentEnd0).join("\n"),
+        lineStart: parentStart0 + 1,
+        lineEnd: parentEnd0,
+        heading: sec.heading,
+      });
+
+      const parentIdx = parents.length - 1;
+      for (const b of pack.blocks) {
+        if (b.content.trim().length < MIN_CHILD_CHARS) continue;
+        children.push({
+          content: b.content,
+          lineStart: b.lineStart,
+          lineEnd: b.lineEnd,
+          parent: parentIdx,
+        });
+      }
+    }
+
+    // A section with blocks where every child was filtered out would be
+    // unsearchable — fall back to the first block of each empty pack.
+    for (let p = 0; p < packs.length; p++) {
+      const pack = packs[p];
+      if (pack.blocks.length === 0) continue;
+      const parentIdx = parents.length - packs.length + p;
+      if (children.some(c => c.parent === parentIdx)) continue;
+      const b = pack.blocks[0];
+      children.push({ content: b.content, lineStart: b.lineStart, lineEnd: b.lineEnd, parent: parentIdx });
+    }
+  }
+
+  return { parents, children };
+}
+
+/** Pick the chunker for a file: parent-child for markdown, flat otherwise. */
+export function chunkForFile(fp: string, text: string): ChunkedDoc {
+  if (isMarkdownPath(fp)) return chunkMarkdownParentChild(text);
+  const flat = chunkText(text);
+  return {
+    parents: [],
+    children: flat.map(c => ({ content: c.content, lineStart: c.lineStart, lineEnd: c.lineEnd, parent: null })),
+  };
+}
+
 export function collectFiles(
   dirPath: string,
   exts?: Set<string>,
@@ -45,9 +244,13 @@ export function collectFiles(
 
   function acceptable(fp: string, size: number): boolean {
     const ext = extname(fp).toLowerCase();
-    if (allowed.has(ext)) return size < TEXT_MAX_BYTES;
-    if (BINARY_DOC_EXTS.has(ext)) return size < BINARY_DOC_MAX_BYTES;
-    return false;
+    // Binary document formats (pdf/docx) get their own (larger) size cap even
+    // when they are explicitly requested via the `exts` parameter — e.g. the
+    // md-sync scanner passes DOC_CONVERT_EXTS to enumerate office documents.
+    if (!allowed.has(ext)) return false;
+    // Binary document formats get their own (larger) size cap when they are
+    // explicitly allowed (e.g. the md-sync scanner passes DOC_CONVERT_EXTS).
+    return BINARY_DOC_EXTS.has(ext) ? size < BINARY_DOC_MAX_BYTES : size < TEXT_MAX_BYTES;
   }
 
   function isExcluded(absPath: string): boolean {
@@ -117,9 +320,13 @@ export async function collectFilesAsync(
 
   function acceptable(fp: string, size: number): boolean {
     const ext = extname(fp).toLowerCase();
-    if (allowed.has(ext)) return size < TEXT_MAX_BYTES;
-    if (BINARY_DOC_EXTS.has(ext)) return size < BINARY_DOC_MAX_BYTES;
-    return false;
+    // Binary document formats (pdf/docx) get their own (larger) size cap even
+    // when they are explicitly requested via the `exts` parameter — e.g. the
+    // md-sync scanner passes DOC_CONVERT_EXTS to enumerate office documents.
+    if (!allowed.has(ext)) return false;
+    // Binary document formats get their own (larger) size cap when they are
+    // explicitly allowed (e.g. the md-sync scanner passes DOC_CONVERT_EXTS).
+    return BINARY_DOC_EXTS.has(ext) ? size < BINARY_DOC_MAX_BYTES : size < TEXT_MAX_BYTES;
   }
 
   function isExcluded(absPath: string): boolean {

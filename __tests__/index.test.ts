@@ -17,21 +17,50 @@ import Database from "better-sqlite3";
 import { load as loadVec } from "sqlite-vec";
 
 // Mock @xenova/transformers so search/embed tests don't load the ~23 MB ONNX
-// model. The mocked pipeline handles both single-string and batched-array
-// inputs (commit 849e485 fix).
-vi.mock("@xenova/transformers", () => ({
-  pipeline: vi.fn().mockResolvedValue(
-    vi.fn().mockImplementation(async (texts: string | string[]) => {
-      // Mirror the real Xenova/transformers batch API: always return a single
-      // Tensor-like object whose `data` is a flat Float32Array of
-      // [batchSize × dim].  Single-string input is treated as batchSize=1.
-      const batch = Array.isArray(texts) ? texts : [texts];
-      const DIM = 384;
-      const flat = new Float32Array(batch.length * DIM).fill(0.1);
-      return { data: flat };
-    })
-  ),
-}));
+// model. The fork's embed.ts drives AutoTokenizer + AutoModel directly (with
+// mean pooling in JS), so the mock models that shape: tokenizer(texts, opts)
+// returns an attention_mask, and model(inputs) returns last_hidden_state.
+vi.mock("@xenova/transformers", () => {
+  const DIM = 384;
+  const makeModel = () =>
+    (async (inputs: any) => {
+      const batch = inputs.input_ids?.dims?.[0] ?? 1;
+      return {
+        last_hidden_state: {
+          dims: [batch, 1, DIM],
+          data: new Float32Array(batch * DIM).fill(0.1),
+        },
+      };
+    });
+  return {
+    pipeline: vi.fn().mockResolvedValue(
+      vi.fn().mockImplementation(async (texts: string | string[]) => {
+        const batch = Array.isArray(texts) ? texts : [texts];
+        const flat = new Float32Array(batch.length * DIM).fill(0.1);
+        return { data: flat };
+      })
+    ),
+    AutoTokenizer: {
+      from_pretrained: vi.fn().mockResolvedValue(
+        vi.fn().mockImplementation((texts: string | string[]) => {
+          const batch = Array.isArray(texts) ? texts : [texts];
+          return {
+            input_ids: { dims: [batch.length, 1], data: new Float32Array(batch.length).fill(1) },
+            attention_mask: { data: new Float32Array(batch.length).fill(1) },
+          };
+        })
+      ),
+    },
+    AutoModel: { from_pretrained: vi.fn().mockResolvedValue(makeModel()) },
+    AutoModelForSequenceClassification: {
+      from_pretrained: vi.fn().mockResolvedValue(
+        vi.fn().mockImplementation(async () => ({
+          logits: { dims: [1, 1], data: new Float32Array([0.5]) },
+        }))
+      ),
+    },
+  };
+});
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SAMPLE_PDF = readFileSync(join(__dirname, "fixtures", "sample.pdf"));
@@ -42,7 +71,8 @@ import {
   chunkText,
   cosineSimilarity,
   normalize,
-  DEFAULT_TEXT_EXTS,
+  DEFAULT_MARKDOWN_EXTS,
+  DOC_CONVERT_EXTS,
   normalizeExt,
   resolveExtensions,
   collectFiles,
@@ -230,13 +260,15 @@ describe("normalizeExt", () => {
 describe("resolveExtensions", () => {
   it("returns the default set when no overrides", () => {
     const exts = resolveExtensions({ extraExtensions: [], excludeExtensions: [] });
-    for (const e of DEFAULT_TEXT_EXTS) expect(exts.has(e), `default ${e} missing`).toBe(true);
-    expect(exts.size).toBe(DEFAULT_TEXT_EXTS.length);
+    for (const e of DEFAULT_MARKDOWN_EXTS) expect(exts.has(e), `default ${e} missing`).toBe(true);
+    expect(exts.size).toBe(DEFAULT_MARKDOWN_EXTS.length);
   });
-  it("default set covers common languages including the ones from issue #9", () => {
+  it("default set is markdown-only (fork: knowledge base indexes md only)", () => {
     const exts = resolveExtensions({ extraExtensions: [], excludeExtensions: [] });
-    for (const e of [".cs", ".tsx", ".jsx", ".kt", ".swift", ".rb", ".php", ".lua", ".vue", ".svelte"]) {
-      expect(exts.has(e), `expected default set to include ${e}`).toBe(true);
+    expect(exts.has(".md")).toBe(true);
+    expect(exts.has(".markdown")).toBe(true);
+    for (const e of [".ts", ".py", ".docx", ".pdf", ".csv", ".json"]) {
+      expect(exts.has(e), `expected default set to EXCLUDE ${e}`).toBe(false);
     }
   });
   it("extraExtensions are added and normalized", () => {
@@ -246,9 +278,9 @@ describe("resolveExtensions", () => {
     expect(exts.has(".nix")).toBe(true);
   });
   it("excludeExtensions remove from the default set", () => {
-    const exts = resolveExtensions({ extraExtensions: [], excludeExtensions: [".md", "JSON"] });
+    const exts = resolveExtensions({ extraExtensions: [".ts"], excludeExtensions: [".md", "markdown"] });
     expect(exts.has(".md")).toBe(false);
-    expect(exts.has(".json")).toBe(false);
+    expect(exts.has(".markdown")).toBe(false);
     expect(exts.has(".ts")).toBe(true);
   });
   it("empty/whitespace entries are ignored", () => {
@@ -266,34 +298,34 @@ describe("collectFiles", () => {
   afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 
   it("walks dir, applies extension allowlist, skips node_modules and dotdirs", () => {
-    writeFileSync(join(tmp, "a.ts"), "export const a = 1;");
+    writeFileSync(join(tmp, "a.md"), "# a");
     writeFileSync(join(tmp, "b.md"), "# heading");
     writeFileSync(join(tmp, "c.bin"), Buffer.from([0, 1, 2, 3]));
     writeFileSync(join(tmp, "image.png"), Buffer.alloc(10));
     mkdirSync(join(tmp, "node_modules"));
-    writeFileSync(join(tmp, "node_modules", "skip.ts"), "// should not be indexed");
+    writeFileSync(join(tmp, "node_modules", "skip.md"), "// should not be indexed");
     mkdirSync(join(tmp, ".git"));
     writeFileSync(join(tmp, ".git", "config"), "x");
     mkdirSync(join(tmp, ".hidden"));
-    writeFileSync(join(tmp, ".hidden", "secret.ts"), "// hidden");
+    writeFileSync(join(tmp, ".hidden", "secret.md"), "// hidden");
     mkdirSync(join(tmp, "src"));
-    writeFileSync(join(tmp, "src", "deep.py"), "print('hi')");
-    writeFileSync(join(tmp, "huge.ts"), "x".repeat(500_001));
+    writeFileSync(join(tmp, "src", "deep.md"), "# deep");
+    writeFileSync(join(tmp, "huge.md"), "x".repeat(500_001));
 
     const files = collectFiles(tmp).map(f => f.replace(tmp, "")).sort();
-    expect(files).toContain("/a.ts");
+    expect(files).toContain("/a.md");
     expect(files).toContain("/b.md");
-    expect(files).toContain("/src/deep.py");
+    expect(files).toContain("/src/deep.md");
     expect(files.some(f => f.includes("node_modules"))).toBe(false);
     expect(files.some(f => f.includes(".git"))).toBe(false);
     expect(files.some(f => f.includes(".hidden"))).toBe(false);
     expect(files.some(f => f.endsWith(".bin") || f.endsWith(".png"))).toBe(false);
-    expect(files.some(f => f.endsWith("huge.ts"))).toBe(false);
+    expect(files.some(f => f.endsWith("huge.md"))).toBe(false);
   });
 
   it("file path returns single entry when extension allowed", () => {
-    const fp = join(tmp, "single.ts");
-    writeFileSync(fp, "export {};");
+    const fp = join(tmp, "single.md");
+    writeFileSync(fp, "# single");
     expect(collectFiles(fp)).toEqual([fp]);
   });
 
@@ -307,27 +339,30 @@ describe("collectFiles", () => {
     expect(collectFiles(join(tmpdir(), "definitely-not-here-xyz-12345"))).toEqual([]);
   });
 
-  it("picks up .pdf and .docx even without being in TEXT_EXTS", () => {
+  it("default index is markdown-only; documents need DOC_CONVERT_EXTS opt-in", () => {
     writeFileSync(join(tmp, "doc.pdf"), Buffer.from("%PDF-1.4 stub"));
     writeFileSync(join(tmp, "doc.docx"), Buffer.from("PK\x03\x04 stub"));
-    writeFileSync(join(tmp, "a.ts"), "x");
+    writeFileSync(join(tmp, "a.md"), "# a");
     const files = collectFiles(tmp).map(f => f.replace(tmp, "")).sort();
-    expect(files).toContain("/doc.pdf");
-    expect(files).toContain("/doc.docx");
-    expect(files).toContain("/a.ts");
+    expect(files).toContain("/a.md");
+    expect(files).not.toContain("/doc.pdf");
+    expect(files).not.toContain("/doc.docx");
+    const docs = collectFiles(tmp, DOC_CONVERT_EXTS).map(f => f.replace(tmp, "")).sort();
+    expect(docs).toContain("/doc.pdf");
+    expect(docs).toContain("/doc.docx");
   });
 
-  it("9 MB PDF accepted, 500 KB text rejected", () => {
+  it("9 MB PDF accepted via DOC_CONVERT_EXTS, 500 KB text rejected", () => {
     writeFileSync(join(tmp, "big.pdf"), Buffer.alloc(9_000_000));
     writeFileSync(join(tmp, "big.txt"), "x".repeat(500_000));
-    const files = collectFiles(tmp).map(f => f.replace(tmp, "")).sort();
+    const files = collectFiles(tmp, DOC_CONVERT_EXTS).map(f => f.replace(tmp, "")).sort();
     expect(files).toContain("/big.pdf");
     expect(files.some(f => f.endsWith("big.txt"))).toBe(false);
   });
 
-  it("PDF over 10 MB cap is rejected", () => {
+  it("PDF over 10 MB cap is rejected (documents opt-in)", () => {
     writeFileSync(join(tmp, "huge.pdf"), Buffer.alloc(10_000_000));
-    expect(collectFiles(tmp).length).toBe(0);
+    expect(collectFiles(tmp, DOC_CONVERT_EXTS).length).toBe(0);
   });
 
   it("custom extension set is honored", () => {
@@ -339,28 +374,28 @@ describe("collectFiles", () => {
   });
 
   it("excludePatterns filters a top-level file", () => {
-    writeFileSync(join(tmp, "a.ts"), "x");
-    writeFileSync(join(tmp, "b.ts"), "x");
-    const files = collectFiles(tmp, undefined, ["b.ts"]).map(f => f.replace(tmp, ""));
-    expect(files).not.toContain("/b.ts");
-    expect(files).toContain("/a.ts");
+    writeFileSync(join(tmp, "a.md"), "x");
+    writeFileSync(join(tmp, "b.md"), "x");
+    const files = collectFiles(tmp, undefined, ["b.md"]).map(f => f.replace(tmp, ""));
+    expect(files).not.toContain("/b.md");
+    expect(files).toContain("/a.md");
   });
 
   it("excludePatterns filters a whole directory subtree", () => {
-    writeFileSync(join(tmp, "a.ts"), "x");
+    writeFileSync(join(tmp, "a.md"), "x");
     mkdirSync(join(tmp, "gen"));
-    writeFileSync(join(tmp, "gen", "ignored.ts"), "x");
+    writeFileSync(join(tmp, "gen", "ignored.md"), "x");
     const files = collectFiles(tmp, undefined, ["gen/"]).map(f => f.replace(tmp, ""));
     expect(files.some(f => f.includes("/gen/"))).toBe(false);
-    expect(files).toContain("/a.ts");
+    expect(files).toContain("/a.md");
   });
 
   it("extension glob exclude", () => {
-    writeFileSync(join(tmp, "page.html"), "<p>x</p>");
-    writeFileSync(join(tmp, "a.ts"), "x");
-    const files = collectFiles(tmp, undefined, ["*.html"]).map(f => f.replace(tmp, ""));
-    expect(files.some(f => f.endsWith(".html"))).toBe(false);
-    expect(files.some(f => f.endsWith(".ts"))).toBe(true);
+    writeFileSync(join(tmp, "page.md"), "<p>x</p>");
+    writeFileSync(join(tmp, "a.md"), "x");
+    const files = collectFiles(tmp, undefined, ["*.md"]).map(f => f.replace(tmp, ""));
+    expect(files).not.toContain("/page.md");
+    expect(files).not.toContain("/a.md");
   });
 });
 
@@ -371,8 +406,8 @@ describe("collectFromTracked", () => {
     const a = mkdtempSync(join(tmpdir(), "rag-track-a-"));
     const b = mkdtempSync(join(tmpdir(), "rag-track-b-"));
     try {
-      writeFileSync(join(a, "x.ts"), "x");
-      writeFileSync(join(b, "y.ts"), "y");
+      writeFileSync(join(a, "x.md"), "x");
+      writeFileSync(join(b, "y.md"), "y");
       const cfg = {
         ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
         extraExtensions: [], excludeExtensions: [],
@@ -380,9 +415,9 @@ describe("collectFromTracked", () => {
         excludePatterns: [],
       };
       const files = collectFromTracked(cfg);
-      expect(files.filter(f => f.endsWith("x.ts")).length).toBe(1);
-      expect(files.some(f => f.endsWith("x.ts"))).toBe(true);
-      expect(files.some(f => f.endsWith("y.ts"))).toBe(true);
+      expect(files.filter(f => f.endsWith("x.md")).length).toBe(1);
+      expect(files.some(f => f.endsWith("x.md"))).toBe(true);
+      expect(files.some(f => f.endsWith("y.md"))).toBe(true);
     } finally {
       rmSync(a, { recursive: true, force: true });
       rmSync(b, { recursive: true, force: true });
@@ -392,7 +427,7 @@ describe("collectFromTracked", () => {
   it("silently skips non-existent tracked paths", () => {
     const a = mkdtempSync(join(tmpdir(), "rag-track-a-"));
     try {
-      writeFileSync(join(a, "x.ts"), "x");
+      writeFileSync(join(a, "x.md"), "x");
       const cfg = {
         ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
         extraExtensions: [], excludeExtensions: [],
@@ -408,9 +443,9 @@ describe("collectFromTracked", () => {
   it("applies excludePatterns per tracked root", () => {
     const root = mkdtempSync(join(tmpdir(), "rag-track-"));
     try {
-      writeFileSync(join(root, "a.ts"), "x");
+      writeFileSync(join(root, "a.md"), "x");
       mkdirSync(join(root, "gen"));
-      writeFileSync(join(root, "gen", "ignored.ts"), "x");
+      writeFileSync(join(root, "gen", "ignored.md"), "x");
       const cfg = {
         ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
         extraExtensions: [], excludeExtensions: [],
@@ -419,7 +454,7 @@ describe("collectFromTracked", () => {
       };
       const files = collectFromTracked(cfg);
       expect(files.some(f => f.includes("/gen/"))).toBe(false);
-      expect(files.some(f => f.endsWith("a.ts"))).toBe(true);
+      expect(files.some(f => f.endsWith("a.md"))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -448,21 +483,21 @@ describe("collectFilesAsync", () => {
   it("walks a tree like the sync version (extension allowlist, skip dirs, size caps)", async () => {
     const root = mkdtempSync(join(tmpdir(), "rag-async-walk-"));
     try {
-      writeFileSync(join(root, "a.ts"), "x");
+      writeFileSync(join(root, "a.md"), "x");
       writeFileSync(join(root, "b.md"), "x");
-      writeFileSync(join(root, "huge.ts"), "x".repeat(500_001));
+      writeFileSync(join(root, "huge.md"), "x".repeat(500_001));
       mkdirSync(join(root, "node_modules"));
-      writeFileSync(join(root, "node_modules", "skip.ts"), "x");
+      writeFileSync(join(root, "node_modules", "skip.md"), "x");
       mkdirSync(join(root, "src"));
-      writeFileSync(join(root, "src", "deep.py"), "x");
+      writeFileSync(join(root, "src", "deep.md"), "x");
 
       const { collectFilesAsync } = await import("../index.ts");
       const files = (await collectFilesAsync(root)).map(f => f.replace(root, "")).sort();
-      expect(files).toContain("/a.ts");
+      expect(files).toContain("/a.md");
       expect(files).toContain("/b.md");
-      expect(files).toContain("/src/deep.py");
+      expect(files).toContain("/src/deep.md");
       expect(files.some(f => f.includes("node_modules"))).toBe(false);
-      expect(files.some(f => f.endsWith("huge.ts"))).toBe(false);
+      expect(files.some(f => f.endsWith("huge.md"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -471,12 +506,12 @@ describe("collectFilesAsync", () => {
   it("excludePatterns work the same as in the sync collectFiles", async () => {
     const root = mkdtempSync(join(tmpdir(), "rag-async-excl-"));
     try {
-      writeFileSync(join(root, "page.html"), "<p>x</p>");
-      writeFileSync(join(root, "a.ts"), "x");
+      writeFileSync(join(root, "page.md"), "<p>x</p>");
+      writeFileSync(join(root, "a.md"), "x");
       const { collectFilesAsync } = await import("../index.ts");
-      const files = (await collectFilesAsync(root, undefined, ["*.html"])).map(f => f.replace(root, ""));
-      expect(files.some(f => f.endsWith(".html"))).toBe(false);
-      expect(files.some(f => f.endsWith(".ts"))).toBe(true);
+      const files = (await collectFilesAsync(root, undefined, ["*.md"])).map(f => f.replace(root, ""));
+      expect(files).not.toContain("/page.md");
+      expect(files).not.toContain("/a.md");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

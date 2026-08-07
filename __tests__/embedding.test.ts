@@ -18,12 +18,20 @@
 import { describe, it, expect, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { load as loadVec } from "sqlite-vec";
-import {
-  embed, cosineSimilarity, hybridSearch, sha256, initSchema,
-} from "../index.ts";
 
 const skip = process.env.SKIP_EMBEDDING_TESTS === "1";
 const EMBED_TIMEOUT = 120_000;
+
+// This suite runs the REAL ONNX pipeline against the DEFAULT embedding model
+// (Xenova/bge-m3, 1024-dim). vitest.config.ts sets RAG_EMBEDDING_DIM=384 for
+// the mocked index.test.ts suite, so override it here BEFORE the dynamic
+// imports below evaluate constants.ts. If you change the default embedding
+// model, update this to match.
+process.env.RAG_EMBEDDING_DIM = "1024";
+process.env.RAG_RERANKER = "false";
+
+const { embed, cosineSimilarity, hybridSearch, sha256, initSchema } = await import("../index.ts");
+const { VECTOR_DIM } = await import("../constants.ts");
 
 // Close the cached DB singleton after every test so it can't leak into the next test
 afterEach(async () => {
@@ -32,10 +40,10 @@ afterEach(async () => {
 });
 
 describe("embed (real ONNX)", () => {
-  it.skipIf(skip)("returns a 384-dim unit-normalized vector for a single string", async () => {
+  it.skipIf(skip)(`returns a ${VECTOR_DIM}-dim unit-normalized vector for a single string`, async () => {
     const v = await embed("hello world");
     expect(Array.isArray(v)).toBe(true);
-    expect(v.length).toBe(384);
+    expect(v.length).toBe(VECTOR_DIM);
     const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
     expect(Math.abs(norm - 1)).toBeLessThan(1e-3);
     expect(v.some(x => x !== 0)).toBe(true);

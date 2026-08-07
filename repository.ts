@@ -16,12 +16,58 @@ import { VECTOR_DIM } from "./constants.ts";
 
 // ─── Schema ──────────────────────────────────────────────────────────────
 
+/**
+ * Bump when the physical schema changes in a way that requires a rebuild:
+ *   v2 — FTS5 tokenize=trigram (CJK support), parents table, chunks.parent_id,
+ *        VECTOR_DIM may have changed (embedding model now configurable).
+ */
+export const SCHEMA_VERSION = 2;
+
+/** Returns the stored schema version, or 0 when unset (fresh / legacy DB). */
+export function getSchemaVersion(db: Database.Database): number {
+  try {
+    const row = db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get() as
+      | { value?: string }
+      | undefined;
+    return row?.value ? Number(row.value) : 0;
+  } catch {
+    return 0; // metadata table does not exist yet
+  }
+}
+
 export function initSchema(db: Database.Database) {
+  const version = getSchemaVersion(db);
+
+  if (version > 0 && version < SCHEMA_VERSION) {
+    // ── v1 → v2 migration ──
+    // The old FTS table used the unicode61 tokenizer (no CJK segmentation)
+    // and chunks_vec may have the wrong dimension. Drop both; they are
+    // rebuilt below from the chunks table (FTS) / lazily re-embedded (vec).
+    db.exec(`
+      DROP TABLE IF EXISTS chunks_fts;
+      DROP TABLE IF EXISTS chunks_vec;
+    `);
+    // Vector data is gone — mark every file for re-embedding.
+    db.prepare("UPDATE files SET embedded = 0").run();
+  }
+
   db.exec(`DROP TRIGGER IF EXISTS chunks_ai; DROP TRIGGER IF EXISTS chunks_ad;`);
   db.exec(`
     CREATE TABLE IF NOT EXISTS metadata (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS parents (
+      id          TEXT PRIMARY KEY,
+      file_path   TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      line_start  INTEGER NOT NULL,
+      line_end    INTEGER NOT NULL,
+      heading     TEXT,
+      hash        TEXT NOT NULL,
+      indexed_at  TEXT NOT NULL,
+      tokens      INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS chunks (
@@ -32,13 +78,18 @@ export function initSchema(db: Database.Database) {
       line_end    INTEGER NOT NULL,
       chunk_hash  TEXT NOT NULL,
       indexed_at  TEXT NOT NULL,
-      tokens      INTEGER NOT NULL
+      tokens      INTEGER NOT NULL,
+      parent_id   TEXT REFERENCES parents(id)
     );
 
+    -- tokenize='trigram' gives CJK 3-gram segmentation; unicode61 (the
+    -- default) treats a run of Chinese characters as ONE token, so Chinese
+    -- keyword search silently fails. Requires SQLite >= 3.34 (bundled).
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
       chunk_content,
       file_path,
-      content_rowid=rowid
+      content_rowid=rowid,
+      tokenize='trigram'
     );
 
     CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
@@ -66,7 +117,27 @@ export function initSchema(db: Database.Database) {
     -- Re-indexing deletes chunks per file (DELETE … WHERE file_path = ?);
     -- without this index each delete full-scans the chunks table.
     CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
+    CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id);
   `);
+
+  // Backfill chunks.parent_id for legacy tables that predate the column.
+  const chunkCols = db.prepare("PRAGMA table_info(chunks)").all() as Array<{ name: string }>;
+  if (!chunkCols.some(c => c.name === "parent_id")) {
+    db.exec("ALTER TABLE chunks ADD COLUMN parent_id TEXT REFERENCES parents(id)");
+  }
+
+  // If the FTS table was dropped in the migration (or created empty for a
+  // pre-existing chunks table), re-populate it from the chunks table.
+  const ftsCount = (db.prepare("SELECT COUNT(*) AS c FROM chunks_fts").get() as { c: number }).c;
+  const chunkCount = (db.prepare("SELECT COUNT(*) AS c FROM chunks").get() as { c: number }).c;
+  if (ftsCount === 0 && chunkCount > 0) {
+    db.exec(`
+      INSERT INTO chunks_fts(rowid, chunk_content, file_path)
+      SELECT rowid, chunk_content, file_path FROM chunks;
+    `);
+  }
+
+  db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
 }
 
 // ─── Chunks ──────────────────────────────────────────────────────────────
@@ -81,6 +152,7 @@ export interface ChunkRow {
   chunk_hash: string;
   indexed_at: string;
   tokens: number;
+  parent_id: string | null;
 }
 
 export interface NewChunk {
@@ -92,6 +164,31 @@ export interface NewChunk {
   hash: string;
   indexedAt: string;
   tokens: number;
+  parentId?: string | null;
+}
+
+export interface ParentRow {
+  id: string;
+  file_path: string;
+  content: string;
+  line_start: number;
+  line_end: number;
+  heading: string | null;
+  hash: string;
+  indexed_at: string;
+  tokens: number;
+}
+
+export interface NewParent {
+  id: string;
+  filePath: string;
+  content: string;
+  lineStart: number;
+  lineEnd: number;
+  heading: string | null;
+  hash: string;
+  indexedAt: string;
+  tokens: number;
 }
 
 export function hasAnyChunks(db: Database.Database): boolean {
@@ -100,13 +197,21 @@ export function hasAnyChunks(db: Database.Database): boolean {
 
 export function insertChunk(db: Database.Database, c: NewChunk) {
   return db.prepare(`
-    INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(c.id, c.filePath, c.content, c.lineStart, c.lineEnd, c.hash, c.indexedAt, c.tokens);
+    INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens, parent_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(c.id, c.filePath, c.content, c.lineStart, c.lineEnd, c.hash, c.indexedAt, c.tokens, c.parentId ?? null);
+}
+
+export function insertParent(db: Database.Database, p: NewParent) {
+  return db.prepare(`
+    INSERT INTO parents(id, file_path, content, line_start, line_end, heading, hash, indexed_at, tokens)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(p.id, p.filePath, p.content, p.lineStart, p.lineEnd, p.heading, p.hash, p.indexedAt, p.tokens);
 }
 
 export function deleteChunksForFile(db: Database.Database, filePath: string) {
   db.prepare("DELETE FROM chunks WHERE file_path = ?").run(filePath);
+  db.prepare("DELETE FROM parents WHERE file_path = ?").run(filePath);
 }
 
 export function getChunksByRowids(db: Database.Database, rowids: number[]): ChunkRow[] {
@@ -114,7 +219,7 @@ export function getChunksByRowids(db: Database.Database, rowids: number[]): Chun
   const placeholders = rowids.map(() => "?").join(",");
   return db.prepare(`
     SELECT rowid, id, file_path, chunk_content, line_start, line_end,
-            chunk_hash, indexed_at, tokens
+            chunk_hash, indexed_at, tokens, parent_id
     FROM chunks
     WHERE rowid IN (${placeholders})
   `).all(...rowids) as ChunkRow[];
@@ -124,15 +229,27 @@ export interface LoadedChunk {
   id: string; file: string; content: string;
   lineStart: number; lineEnd: number;
   hash: string; indexed: string; tokens: number;
+  parentId: string | null;
 }
 
 export function getAllChunks(db: Database.Database): LoadedChunk[] {
   return db.prepare(`
     SELECT c.id, c.file_path as file, c.chunk_content as content,
             c.line_start as lineStart, c.line_end as lineEnd,
-            c.chunk_hash as hash, c.indexed_at as indexed, c.tokens
+            c.chunk_hash as hash, c.indexed_at as indexed, c.tokens,
+            c.parent_id as parentId
     FROM chunks c
   `).all() as LoadedChunk[];
+}
+
+export function getParentsByRowids(db: Database.Database, ids: string[]): ParentRow[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return db.prepare(`
+    SELECT id, file_path, content, line_start, line_end, heading, hash, indexed_at, tokens
+    FROM parents
+    WHERE id IN (${placeholders})
+  `).all(...ids) as ParentRow[];
 }
 
 // ─── Vectors (chunks_vec) ────────────────────────────────────────────────
@@ -176,7 +293,7 @@ export function getEmbeddedCount(db: Database.Database): number {
 }
 
 export function clearAllVectors(db: Database.Database) {
-  db.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
+  db.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM parents; DELETE FROM files;");
   db.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
 }
 

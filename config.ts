@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { configFile, getRagDir } from "./store.ts";
-import { DEFAULT_TEXT_EXTS } from "./constants.ts";
+import { DEFAULT_MARKDOWN_EXTS } from "./constants.ts";
 
 export interface RagConfig {
   ragEnabled: boolean;
@@ -40,9 +40,9 @@ export function normalizeExt(ext: string): string {
   return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
 }
 
-/** Build the effective extension allowlist from defaults + user config. */
+/** Build the effective extension allowlist from markdown defaults + user config. */
 export function resolveExtensions(config: Pick<RagConfig, "extraExtensions" | "excludeExtensions">): Set<string> {
-  const set = new Set(DEFAULT_TEXT_EXTS);
+  const set = new Set(DEFAULT_MARKDOWN_EXTS);
   for (const e of config.extraExtensions) {
     const n = normalizeExt(e);
     if (n) set.add(n);

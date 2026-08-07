@@ -1,0 +1,109 @@
+/**
+ * Coverage report tests: md-vs-index comparison, document conversion state,
+ * index freshness, and verdict priority.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { load as loadVec } from "sqlite-vec";
+
+vi.mock("@xenova/transformers", () => {
+  const DIM = 384;
+  return {
+    pipeline: vi.fn().mockResolvedValue(vi.fn()),
+    AutoTokenizer: {
+      from_pretrained: vi.fn().mockResolvedValue(
+        vi.fn().mockImplementation((texts: string | string[]) => {
+          const batch = Array.isArray(texts) ? texts : [texts];
+          return {
+            input_ids: { dims: [batch.length, 1], data: new Float32Array(batch.length).fill(1) },
+            attention_mask: { data: new Float32Array(batch.length).fill(1) },
+          };
+        })
+      ),
+    },
+    AutoModel: {
+      from_pretrained: vi.fn().mockResolvedValue(
+        vi.fn().mockImplementation(async (inputs: any) => {
+          const batch = inputs.input_ids?.dims?.[0] ?? 1;
+          return { last_hidden_state: { dims: [batch, 1, DIM], data: new Float32Array(batch * DIM).fill(0.1) } };
+        })
+      ),
+    },
+    AutoModelForSequenceClassification: { from_pretrained: vi.fn() },
+  };
+});
+
+import { computeCoverage, indexFiles } from "../index.ts";
+import { closeDbConn } from "../db.ts";
+import { initSchema } from "../index.ts";
+import * as repo from "../repository.ts";
+
+function makeRepo() {
+  const root = mkdtempSync(join(tmpdir(), "rag-cov-"));
+  mkdirSync(join(root, "docs"), { recursive: true });
+  writeFileSync(join(root, "docs", "a.md"), "# A\n\n量測裝置內容");
+  writeFileSync(join(root, "docs", "b.md"), "# B\n\n審查委員會核准函內容");
+  return root;
+}
+
+describe("computeCoverage", () => {
+  let root: string;
+  let db: Database.Database;
+  beforeEach(() => {
+    closeDbConn();
+    root = makeRepo();
+    db = new Database(":memory:");
+    db.pragma("journal_mode = WAL");
+    loadVec(db);
+    initSchema(db);
+  });
+  afterEach(() => {
+    closeDbConn();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("verdict needs_index when md files are not indexed yet", async () => {
+    const report = await computeCoverage(root, { db });
+    expect(report.verdict).toBe("needs_index");
+    expect(report.markdown.total).toBe(2);
+    expect(report.markdown.missing.length).toBe(2);
+  });
+
+  it("verdict complete when everything is indexed and no docs to convert", async () => {
+    await indexFiles([join(root, "docs", "a.md"), join(root, "docs", "b.md")], {}, db);
+    const report = await computeCoverage(root, { db });
+    expect(report.verdict).toBe("complete");
+    expect(report.markdown.missing.length).toBe(0);
+    expect(report.markdown.modified.length).toBe(0);
+    expect(report.index.vectorCoveragePct).toBe(100);
+  });
+
+  it("verdict needs_index when a md file changed after indexing", async () => {
+    await indexFiles([join(root, "docs", "a.md")], {}, db);
+    writeFileSync(join(root, "docs", "a.md"), "# A CHANGED\n\n新的內容");
+    const report = await computeCoverage(root, { db });
+    expect(report.verdict).toBe("needs_index");
+    expect(report.markdown.modified.length).toBe(1);
+  });
+
+  it("verdict needs_convert when a docx has no markdown", async () => {
+    mkdirSync(join(root, "raw"), { recursive: true });
+    writeFileSync(join(root, "raw", "report.docx"), "PK\x03\x04 stub");
+    const report = await computeCoverage(root, { db });
+    expect(report.documents.total).toBe(1);
+    expect(report.documents.needs_convert).toBe(1);
+    // needs_convert outranks needs_index
+    expect(report.verdict).toBe("needs_convert");
+  });
+
+  it("verdict stale when last build is older than 24h", async () => {
+    await indexFiles([join(root, "docs", "a.md"), join(root, "docs", "b.md")], {}, db);
+    repo.setMetadata(db, repo.MetadataKey.LastBuild, new Date(Date.now() - 25 * 3600 * 1000).toISOString());
+    const report = await computeCoverage(root, { db });
+    expect(report.index.stale).toBe(true);
+    expect(report.verdict).toBe("stale");
+  });
+});

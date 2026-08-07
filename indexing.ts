@@ -3,7 +3,7 @@ import Database from "better-sqlite3";
 import { getDbConn, type IndexStats } from "./db.ts";
 import { EMBEDDING_MODEL } from "./constants.ts";
 import { embedBatch } from "./embed.ts";
-import { chunkText, extractText, sha256 } from "./chunking.ts";
+import { chunkForFile, extractText, sha256, type ChunkedDoc } from "./chunking.ts";
 import * as repo from "./repository.ts";
 
 export interface ProgressCallbacks {
@@ -35,7 +35,23 @@ interface FileWork {
   fp: string;
   hash: string;
   size: number;
-  rawChunks: { content: string; lineStart: number; lineEnd: number; hash: string }[];
+  /** Parent blocks with stable ids + content hashes (markdown sections). */
+  rawParents: {
+    id: string;
+    content: string;
+    lineStart: number;
+    lineEnd: number;
+    heading: string | null;
+    hash: string;
+  }[];
+  /** Searchable units (paragraphs for markdown, flat chunks otherwise). */
+  rawChildren: {
+    content: string;
+    lineStart: number;
+    lineEnd: number;
+    parentId: string | null;
+    hash: string;
+  }[];
   _vectors?: number[][];
 }
 
@@ -60,7 +76,7 @@ export async function indexFiles(
     const CONCURRENCY = 32;
     const YIELD_INTERVAL = 64;
 
-    interface ReadResult { fp: string; hash: string; size: number; raw: { content: string; lineStart: number; lineEnd: number }[] }
+    interface ReadResult { fp: string; hash: string; size: number; doc: ChunkedDoc }
 
     const readQueue: ReadResult[] = [];
     let readQueueDone = false;
@@ -80,8 +96,8 @@ export async function indexFiles(
           if (i >= paths.length) { producersDone++; if (producersDone >= workerCount) { readQueueDone = true; notifyRead(); } return; }
           try {
             const { text, hash, size } = await extractText(paths[i]);
-            const raw = chunkText(text);
-            readQueue.push({ fp: paths[i], hash, size, raw });
+            const doc = chunkForFile(paths[i], text);
+            readQueue.push({ fp: paths[i], hash, size, doc });
             notifyRead();
           } catch {
             readErrorCount++;
@@ -112,11 +128,28 @@ export async function indexFiles(
         repo.deleteVectorsForFile(database, r.fp);
         repo.deleteChunksForFile(database, r.fp);
 
-        const rawChunks = r.raw.map(c => ({ ...c, hash: sha256(c.content) }));
-        stderrProgress(`[${processedCount}/${total}] chunked ${name} (${rawChunks.length} chunks)`);
+        const fileKey = sha256(r.fp);
+        const rawParents = r.doc.parents.map(p => ({
+          id: `${fileKey}-p-${p.lineStart}`,
+          content: p.content,
+          lineStart: p.lineStart,
+          lineEnd: p.lineEnd,
+          heading: p.heading,
+          hash: sha256(p.content),
+        }));
+        const parentIdByIndex = new Map<number, string>(rawParents.map((p, i) => [i, p.id]));
+        const rawChildren = r.doc.children.map(c => ({
+          content: c.content,
+          lineStart: c.lineStart,
+          lineEnd: c.lineEnd,
+          parentId: c.parent !== null ? parentIdByIndex.get(c.parent) ?? null : null,
+          hash: sha256(c.content),
+        }));
+
+        stderrProgress(`[${processedCount}/${total}] chunked ${name} (${rawChildren.length} chunks / ${rawParents.length} parents)`);
         progress?.onFile?.(processedCount, total, name, skipped);
 
-        toIndex.push({ fp: r.fp, hash: r.hash, size: r.size, rawChunks });
+        toIndex.push({ fp: r.fp, hash: r.hash, size: r.size, rawParents, rawChildren });
       }
     };
 
@@ -141,16 +174,16 @@ export async function indexFiles(
     const EMBED_GROUP_TARGET = 256;
     const groupChunks: { fw: FileWork; ci: number }[] = [];
     let globalChunkIdx = 0;
-    const totalChunks = toIndex.reduce((s, f) => s + f.rawChunks.length, 0);
+    const totalChunks = toIndex.reduce((s, f) => s + f.rawChildren.length, 0);
 
     const flushGroup = async () => {
       if (groupChunks.length === 0) return;
-      const texts = groupChunks.map(g => g.fw.rawChunks[g.ci].content);
+      const texts = groupChunks.map(g => g.fw.rawChildren[g.ci].content);
       stderrProgress(`Embedding ${globalChunkIdx - groupChunks.length + 1}…${globalChunkIdx}/${totalChunks} chunks`);
       const vectors = await embedBatch(texts);
       for (let vi = 0; vi < groupChunks.length; vi++) {
         const g = groupChunks[vi];
-        g.fw._vectors ??= new Array(g.fw.rawChunks.length);
+        g.fw._vectors ??= new Array(g.fw.rawChildren.length);
         g.fw._vectors[g.ci] = vectors[vi];
       }
       progress?.onEmbed?.(globalChunkIdx, totalChunks);
@@ -160,7 +193,7 @@ export async function indexFiles(
     };
 
     for (const fw of toIndex) {
-      for (let j = 0; j < fw.rawChunks.length; j++) {
+      for (let j = 0; j < fw.rawChildren.length; j++) {
         groupChunks.push({ fw, ci: j });
         globalChunkIdx++;
         if (groupChunks.length >= EMBED_GROUP_TARGET) await flushGroup();
@@ -168,26 +201,41 @@ export async function indexFiles(
     }
     await flushGroup();
 
-    // Phase 3: insert chunks + vectors into DB
+    // Phase 3: insert parents + children + vectors into DB
     let chunked = 0;
     const indexedAt = new Date().toISOString();
     const tx = database.transaction(() => {
       for (const fw of toIndex) {
         const vectors = fw._vectors;
-        for (let j = 0; j < fw.rawChunks.length; j++) {
-          const c = fw.rawChunks[j];
+        const fileKey = sha256(fw.fp);
+        for (const p of fw.rawParents) {
+          repo.insertParent(database, {
+            id: p.id,
+            filePath: fw.fp,
+            content: p.content,
+            lineStart: p.lineStart,
+            lineEnd: p.lineEnd,
+            heading: p.heading,
+            hash: p.hash,
+            indexedAt,
+            tokens: Math.ceil(p.content.length / 4),
+          });
+        }
+        for (let j = 0; j < fw.rawChildren.length; j++) {
+          const c = fw.rawChildren[j];
           const chunkResult = repo.insertChunk(database, {
-            id: `${sha256(fw.fp)}-${c.lineStart}`,
+            id: `${fileKey}-${c.lineStart}`,
             filePath: fw.fp, content: c.content,
             lineStart: c.lineStart, lineEnd: c.lineEnd, hash: c.hash,
             indexedAt, tokens: Math.ceil(c.content.length / 4),
+            parentId: c.parentId,
           });          
           if (vectors?.[j]) {
             repo.insertVector(database, Number(chunkResult.lastInsertRowid), vectors[j]);
           }
           chunked++;
         }
-        repo.upsertFile(database, fw.fp, fw.hash, fw.rawChunks.length, indexedAt, fw.size, true);
+        repo.upsertFile(database, fw.fp, fw.hash, fw.rawChildren.length, indexedAt, fw.size, true);
       }
     });
 

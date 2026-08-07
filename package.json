@@ -1,7 +1,7 @@
 {
   "name": "pi-local-rag",
-  "version": "0.4.1",
-  "description": "Local hybrid RAG pipeline for the Pi coding agent. SQLite FTS5 + sqlite-vec, ONNX embeddings via Transformers.js, PDF/DOCX/HTML extraction (with OCR fallback), per-project storage, auto-injection. Zero cloud dependency.",
+  "version": "0.5.0",
+  "description": "Markdown-only hybrid RAG for the Pi coding agent (jimewu fork): bge-m3 multilingual embeddings, cross-encoder reranker, parent-child chunking, FTS5 trigram CJK search, and an md-sync scanner that verifies docx/pdf/csv → markdown conversion via sha256 checksums. Zero cloud dependency.",
   "type": "module",
   "main": "./index.ts",
   "exports": {
@@ -19,6 +19,7 @@
     "indexing.ts",
     "types/**/*.d.ts",
     "README.md",
+    "README_zh.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
@@ -89,5 +90,9 @@
     "@vitest/coverage-v8": "^4.1.7",
     "jszip": "^3.10.1",
     "vitest": "^4.1.7"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.10.0": true,
+    "sharp@0.32.6": true
   }
 }
