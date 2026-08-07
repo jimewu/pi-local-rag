@@ -61,7 +61,7 @@ function textSha256(fp: string): string {
   return createHash("sha256").update(readFileSync(fp, "utf-8")).digest("hex").slice(0, 12);
 }
 
-/** Resolve symlinks (e.g. /Documents → )
+/** Resolve symlinks (e.g. /home/user/Documents → /srv/data/Documents)
  *  so index paths and scanned paths compare as the same physical file.
  *  Falls back to the input path when it no longer exists. */
 function realOf(p: string): string {
@@ -101,7 +101,7 @@ export async function computeCoverage(
   // A file's identity is compared on two levels so a moved/renamed repo
   // directory doesn't flip the whole report to 0%:
   //   1. resolved realpath — covers symlinked aliases of `root` (e.g.
-  //      /Documents → );
+  //      /home/user/Documents → /srv/data/Documents);
   //   2. relative path from the repo root — covers relocating the whole
   //      case repo: the db stores absolute paths from the old location,
   //      but the path *relative to the repo root* is unchanged by the move.

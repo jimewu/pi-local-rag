@@ -46,6 +46,10 @@ pi install /path/to/pi-local-rag
 | `RAG_RERANKER_MODEL` | `Xenova/bge-reranker-base` | Cross-encoder reranker |
 | `RAG_RERANK_TOP_K` | `20` | 送入 reranker 的混合檢索候選數 |
 | `PI_RAG_DIR` | — | 明確指定儲存位置（優先於 walk-up） |
+| `RAG_EMBED_URL` | — | 外部 embedding server 的 base URL（llama-swap / 任何 OpenAI 相容，如 `http://127.0.0.1:18080`）。設定後 embedding 改走 HTTP；輸出會 MRL 截斷到 `RAG_EMBEDDING_DIM` 並重新正規化。未設定 → 本地 ONNX（Transformers.js） |
+| `RAG_RERANK_URL` | — | 外部 rerank server 的 base URL（`POST /v1/rerank`，如 llama-swap）。未設定 → 本地 ONNX reranker |
+| `RAG_EMBED_MODEL` | `qwen3-embedding-4b` | 向 embedding server 請求的模型名稱 |
+| `RAG_RERANK_MODEL` | `qwen3-reranker-4b` | 向 rerank server 請求的模型名稱 |
 
 模型首次使用時從 HuggingFace 下載一次並快取於本機。
 

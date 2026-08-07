@@ -109,7 +109,7 @@ describe("computeCoverage", () => {
 
   it("matches indexed files after the scan root is a symlink alias of the stored path", async () => {
     // Regression: index paths stored under a symlinked alias (e.g.
-    // /Documents → ) must still be
+    // /home/user/Documents → /srv/data/Documents) must still be
     // recognized when coverage scans via the other alias — plain string
     // startsWith() comparison would report every file as missing.
     const realRoot = mkdtempSync(join(tmpdir(), "rag-cov-real-"));

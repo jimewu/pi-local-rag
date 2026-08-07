@@ -1,4 +1,44 @@
-import { EMBEDDING_MODEL, RERANKER_MODEL, RERANKER_ENABLED, EMBED_MAX_LENGTH, EMBED_BATCH_SIZE } from "./constants.ts";
+import {
+  EMBEDDING_MODEL, RERANKER_MODEL, RERANKER_ENABLED,
+  EMBED_MAX_LENGTH, EMBED_BATCH_SIZE, VECTOR_DIM,
+} from "./constants.ts";
+
+// ─── HTTP backend (llama-swap / any OpenAI-compatible server) ───────────────
+// Set RAG_EMBED_URL / RAG_RERANK_URL to route embedding/reranking to an
+// external server (e.g. llama-swap serving Qwen3 GGUF on the local GPU).
+// Nothing machine-specific is baked into this repo — the URLs come from the
+// environment. The optional *_MODEL vars name the model on that server; the
+// defaults match the Qwen3 GGUF setup. Output is truncated to VECTOR_DIM
+// (Matryoshka-style: the leading dims carry the most signal) and re-normalized
+// so stored vectors match the local backend's dimension.
+const EMBED_URL = process.env.RAG_EMBED_URL;
+const RERANK_URL = process.env.RAG_RERANK_URL;
+const EMBED_HTTP_MODEL = process.env.RAG_EMBED_MODEL ?? "qwen3-embedding-4b";
+const RERANK_HTTP_MODEL = process.env.RAG_RERANK_MODEL ?? "qwen3-reranker-4b";
+
+/** L2-normalize a vector. Local ONNX output is already normalized; HTTP
+ *  backends return full-width (e.g. 2560-dim) normalized vectors whose
+ *  MRL-truncated sub-vector must be re-normalized before storage. */
+function normalizeL2(v: number[]): number[] {
+  let norm = 0;
+  for (const x of v) norm += x * x;
+  norm = Math.sqrt(norm) || 1;
+  return v.map(x => x / norm);
+}
+
+async function embedHttp(texts: string[]): Promise<number[][]> {
+  const resp = await fetch(`${EMBED_URL}/v1/embeddings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: EMBED_HTTP_MODEL, input: texts }),
+  });
+  if (!resp.ok) {
+    throw new Error(`RAG_EMBED_URL ${EMBED_URL} returned ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  }
+  const data = (await resp.json()) as { data?: Array<{ embedding?: number[] }> };
+  return (data.data ?? []).map(item => normalizeL2((item.embedding ?? []).slice(0, VECTOR_DIM)));
+}
+
 
 // The feature-extraction PIPELINE ignores a `max_length` option (it only
 // passes padding/truncation to the tokenizer, which then truncates to the
@@ -28,6 +68,7 @@ async function getEmbedder() {
  *  over non-padding tokens → L2 normalize. Returns number[][] (dim = model dim). */
 export async function embedTexts(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
+  if (EMBED_URL) return embedHttp(texts);
   const { tokenizer, model } = await getEmbedder();
   const inputs = tokenizer(texts, { padding: true, truncation: true, max_length: EMBED_MAX_LENGTH });
   const outputs = await model(inputs);
@@ -119,7 +160,26 @@ let _reranker: { tokenizer: any; model: any } | null = null;
 let _rerankerLoading: Promise<{ tokenizer: any; model: any } | null> | null = null;
 
 export function isRerankerEnabled(): boolean {
-  return RERANKER_ENABLED;
+  return RERANKER_ENABLED || !!RERANK_URL;
+}
+
+async function rerankHttp(query: string, passages: string[]): Promise<number[]> {
+  const resp = await fetch(`${RERANK_URL}/v1/rerank`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: RERANK_HTTP_MODEL, query, documents: passages }),
+  });
+  if (!resp.ok) {
+    throw new Error(`RAG_RERANK_URL ${RERANK_URL} returned ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  }
+  const data = (await resp.json()) as { results?: Array<{ index: number; relevance_score: number }> };
+  const scores = new Array<number>(passages.length).fill(0);
+  for (const r of data.results ?? []) {
+    if (Number.isInteger(r.index) && r.index >= 0 && r.index < scores.length) {
+      scores[r.index] = Math.min(1, Math.max(0, r.relevance_score));
+    }
+  }
+  return scores;
 }
 
 async function getReranker() {
@@ -153,6 +213,8 @@ export async function rerank(
     const outputs = await scorer(pairs);
     return outputs.map(o => Math.min(1, Math.max(0, typeof o?.score === "number" ? o.score : 0)));
   }
+
+  if (RERANK_URL) return rerankHttp(query, passages);
 
   const rr = await getReranker();
   if (!rr) return null;

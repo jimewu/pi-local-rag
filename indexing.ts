@@ -26,7 +26,7 @@ export function isIndexStale(index: IndexStats, maxAgeMs = 24 * 60 * 60 * 1000):
 const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
 
 /** Resolve symlinks so path comparisons survive aliased paths (e.g.
- *  /Documents → ). Falls back to the
+ *  /home/user/Documents → /srv/data/Documents). Falls back to the
  *  input when the file no longer exists. */
 function realOf(p: string): string {
   try {
@@ -86,7 +86,7 @@ export async function indexFiles(
 
     // Map resolved realpaths → DB-side stored paths so the hash-skip check
     // survives symlinked aliases: a file indexed under one alias (e.g.
-    // /…) is skipped when scanned via the other (/…)
+    // /home/user/…) is skipped when scanned via the other (/srv/data/…)
     // instead of being fully re-read and re-embedded.
     const realToDb = new Map<string, string>();
     for (const p of repo.listFilePaths(database)) {

@@ -567,8 +567,8 @@ describe("indexFiles --force", () => {
 
   it("skips files indexed via a symlinked alias when scanned via the other alias", async () => {
     // Regression: the DB stores paths as they were indexed (e.g.
-    // /Documents/… while scanning resolves to
-    // /…). The hash-skip check must resolve the
+    // /home/user/Documents/… while scanning resolves to
+    // /srv/data/Documents/…). The hash-skip check must resolve the
     // alias so unchanged files are not fully re-read and re-embedded.
     const proj = mkdtempSync(join(tmpdir(), "rag-force-proj-"));
     const alias = join(tmpdir(), `rag-force-alias-${Date.now()}`);

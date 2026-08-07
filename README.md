@@ -46,6 +46,10 @@ Note: pi 0.83 does not load `.tgz` or `git:` package URLs directly; use a direct
 | `RAG_RERANKER_MODEL` | `Xenova/bge-reranker-base` | Cross-encoder reranker |
 | `RAG_RERANK_TOP_K` | `20` | Hybrid candidates sent to the reranker |
 | `PI_RAG_DIR` | — | Explicit store location (wins over walk-up) |
+| `RAG_EMBED_URL` | — | Base URL of an external embedding server (llama-swap / any OpenAI-compatible, e.g. `http://127.0.0.1:18080`). When set, embedding routes over HTTP; output is MRL-truncated to `RAG_EMBEDDING_DIM` and re-normalized. Unset → local ONNX (Transformers.js) |
+| `RAG_RERANK_URL` | — | Base URL of an external rerank server (`POST /v1/rerank`, e.g. llama-swap). Unset → local ONNX reranker |
+| `RAG_EMBED_MODEL` | `qwen3-embedding-4b` | Model name to request on the embedding server |
+| `RAG_RERANK_MODEL` | `qwen3-reranker-4b` | Model name to request on the rerank server |
 
 Models download once from HuggingFace on first use and are cached locally.
 
