@@ -37,6 +37,7 @@ vi.mock("@xenova/transformers", () => {
 import { autoCompleteCoverage, convertOneDocument } from "../index.ts";
 import type { CmdRunner } from "../auto-fix.ts";
 import { closeDbConn } from "../db.ts";
+import { setRagDirGetter } from "../store.ts";
 import { mdTargetFor, readChecksumFile } from "../index.ts";
 
 function makeRepo() {
@@ -67,7 +68,6 @@ describe("convertOneDocument", () => {
   let root: string;
   beforeEach(() => { root = makeRepo(); });
   afterEach(() => { closeDbConn(); rmSync(root, { recursive: true, force: true }); });
-
   it("converts via anydoc and writes the checksum sidecar", async () => {
     const docx = join(root, "docs", "report.docx");
     writeFileSync(docx, "PK\x03\x04 stub");
@@ -113,8 +113,18 @@ describe("convertOneDocument", () => {
 
 describe("autoCompleteCoverage", () => {
   let root: string;
-  beforeEach(() => { root = makeRepo(); });
-  afterEach(() => { closeDbConn(); rmSync(root, { recursive: true, force: true }); });
+  beforeEach(() => {
+    root = makeRepo();
+    // Pin the RAG store inside the scratch repo so autoCompleteCoverage's
+    // internal getDbConn() never falls back to the real ~/.pi/rag global
+    // store (test isolation).
+    setRagDirGetter(() => root);
+  });
+  afterEach(() => {
+    closeDbConn();
+    setRagDirGetter(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  });
 
   it("indexes missing markdown and writes missing checksums", async () => {
     const docx = join(root, "docs", "r.docx");

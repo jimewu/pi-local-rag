@@ -1439,9 +1439,24 @@ describe("before_agent_start: 24h auto-refresh", () => {
 // pattern, adapted for TypeScript.
 describe("getFreshDbConn: [Symbol.dispose] for `using` declaration", () => {
   let mod: typeof import("../index.ts");
+  let ragDir: string;
 
   beforeAll(async () => {
     mod = await import("../index.ts");
+  });
+
+  beforeEach(() => {
+    // Isolate via PI_RAG_DIR (not setRagDirGetter): getFreshDbConn() runs
+    // against a module instance re-imported after vi.resetModules() in
+    // earlier describes, so a getter set on this file's store.ts instance
+    // would be invisible. process.env is shared across instances.
+    ragDir = mkdtempSync(join(tmpdir(), "rag-dispose-"));
+    process.env.PI_RAG_DIR = ragDir;
+  });
+
+  afterEach(() => {
+    delete process.env.PI_RAG_DIR;
+    rmSync(ragDir, { recursive: true, force: true });
   });
 
   it("attaches [Symbol.dispose] to the returned connection", () => {
