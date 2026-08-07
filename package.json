@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./index.ts",
   "bin": {
-    "pi-rag": "./cli.ts"
+    "rag": "./bin/rag"
   },
   "exports": {
     ".": "./index.ts"
@@ -13,6 +13,7 @@
   "files": [
     "index.ts",
     "cli.ts",
+    "bin/rag",
     "constants.ts",
     "store.ts",
     "config.ts",

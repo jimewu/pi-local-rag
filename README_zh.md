@@ -66,34 +66,36 @@ pi -e /path/to/pi-local-rag
 /rag search 產品規格 演算法           # 混合檢索，回傳整個章節
 ```
 
-## CLI（`pi-rag`）
+## CLI（`bin/rag`）
 
-本套件的命令列工具——**不必開啟 pi session** 就能檢查、補完知識庫：
-先看狀態與缺口，全部處理完畢後再啟動 agent 直接開始對話：
+本套件的命令列工具——**不必開啟 pi session** 也**不必安裝本 extension**（執行檔就在本 repo 內），
+就能檢查、補完知識庫：
 
 ```bash
-pi-rag status                       # 索引統計 + 設定
-pi-rag coverage                     # 完整性報告（在 case repo 目錄下執行）
-pi-rag coverage --dir /path/to/case-repo
-pi-rag auto                         # 自動補齊：補 checksum → 轉檔 → 索引
-pi-rag mdsync                       # 文件轉檔狀態
-pi-rag help
+cd /path/to/case-repo
+/path/to/pi-local-rag/bin/rag status    # 索引統計 + 設定
+/path/to/pi-local-rag/bin/rag coverage  # 完整性報告
+/path/to/pi-local-rag/bin/rag auto      # 自動補齊：補 checksum → 轉檔 → 索引
+/path/to/pi-local-rag/bin/rag mdsync    # 文件轉檔狀態
+/path/to/pi-local-rag/bin/rag help
 ```
 
-- `--dir <path>` — case repo 根目錄（預設：目前目錄）。
+- 在 case repo 目錄下執行（RAG store 會向上尋找 `.pi/rag`），或明確指定 `--dir <path>`。
 - `--json` — 機器可讀輸出，方便腳本化。
 - 進行中的進度（轉檔 / 索引 / embedding）即時顯示於 stderr，隨時掌握狀況；
   長時間的自動補齊結束後會印出摘要，並提示「可以啟動 pi 開始對話」。
-- 需要 **Node ≥ 23.6**（原生 TypeScript type stripping）。以 `pi install`
-  安裝後，指令會連結為 `pi-rag`。
+- 需要 **Node ≥ 23.6**（原生 TypeScript type stripping）。
+
+若你之後 `pi install` 本套件，同一 CLI 也會連結為 `rag`。
 
 進 session 前的範例流程：
 
 ```bash
 cd /path/to/case-repo
-pi-rag coverage        # 看看缺什麼
-pi-rag auto            # 補齊（可能需數分鐘；進度即時顯示）
-pi                     # 然後啟動 session 開始對話
+RAG=/path/to/pi-local-rag/bin/rag
+$RAG coverage        # 看看缺什麼
+$RAG auto            # 補齊（可能需數分鐘；進度即時顯示）
+pi                    # 然後啟動 session 開始對話
 ```
 
 ## 指令

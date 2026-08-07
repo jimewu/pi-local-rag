@@ -67,35 +67,38 @@ pi -e /path/to/pi-local-rag
 /rag search 產品規格 演算法         # hybrid search, returns whole sections
 ```
 
-## CLI (`pi-rag`)
+## CLI (`bin/rag`)
 
 A command-line companion that inspects and completes the knowledge base
-**without starting a pi session** — check status, then complete everything
-before opening the agent:
+**without starting a pi session** — and **without installing the extension**
+(the executable lives in this repo):
 
 ```bash
-pi-rag status                     # index statistics + config
-pi-rag coverage                   # completeness report (run from the case repo)
-pi-rag coverage --dir /path/to/case-repo
-pi-rag auto                       # auto-complete: checksums → convert → index
-pi-rag mdsync                     # document conversion state
-pi-rag help
+cd /path/to/case-repo
+/path/to/pi-local-rag/bin/rag status    # index statistics + config
+/path/to/pi-local-rag/bin/rag coverage  # completeness report
+/path/to/pi-local-rag/bin/rag auto      # auto-complete: checksums → convert → index
+/path/to/pi-local-rag/bin/rag mdsync    # document conversion state
+/path/to/pi-local-rag/bin/rag help
 ```
 
-- `--dir <path>` — case repo root (default: current directory).
+- Run it from the case repo directory (the RAG store is resolved by walking
+  up for `.pi/rag`), or pass `--dir <path>` explicitly.
 - `--json` — machine-readable output for scripts.
 - Progress (convert/index/embed) streams to stderr so you always see what
   is happening; long auto-completes finish with a summary and an
   “open pi and start talking” cue.
-- Requires **Node ≥ 23.6** (native TypeScript type stripping). When installed
-  via `pi install`, the binary is linked as `pi-rag`.
+- Requires **Node ≥ 23.6** (native TypeScript type stripping).
+
+If you ever `pi install` this package, the same CLI is also linked as `rag`.
 
 Example workflow before a session:
 
 ```bash
 cd /path/to/case-repo
-pi-rag coverage        # see what's missing
-pi-rag auto            # fix it (may take minutes; progress shown)
+RAG=/path/to/pi-local-rag/bin/rag
+$RAG coverage        # see what's missing
+$RAG auto            # fix it (may take minutes; progress shown)
 pi                    # then start the session
 ```
 

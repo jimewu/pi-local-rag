@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+/**
+ * bin/rag — executable entry for pi-local-rag's CLI companion.
+ *
+ * Runs directly from the repo — no pi install needed:
+ *
+ *   cd /path/to/case-repo
+ *   /path/to/pi-local-rag/bin/rag status
+ *   /path/to/pi-local-rag/bin/rag coverage
+ *   /path/to/pi-local-rag/bin/rag auto
+ *
+ * Requires Node >= 23.6 (native TypeScript type stripping). The RAG store is
+ * resolved from the current working directory (walk-up for .pi/rag), so run
+ * it from the case repo or pass --dir <path>.
+ */
+import { main } from "../cli.ts";
+
+process.exitCode = await main(process.argv.slice(2));
