@@ -16,6 +16,7 @@ const RERANK_URL = process.env.RAG_RERANK_URL;
 const EMBED_HTTP_MODEL = process.env.RAG_EMBED_MODEL ?? "qwen3-embedding-4b";
 const RERANK_HTTP_MODEL = process.env.RAG_RERANK_MODEL ?? "qwen3-reranker-4b";
 
+
 /** L2-normalize a vector. Local ONNX output is already normalized; HTTP
  *  backends return full-width (e.g. 2560-dim) normalized vectors whose
  *  MRL-truncated sub-vector must be re-normalized before storage. */
@@ -26,17 +27,50 @@ function normalizeL2(v: number[]): number[] {
   return v.map(x => x / norm);
 }
 
+/** Conservative per-request budget in CHARACTERS for the HTTP backend.
+ *  For CJK text 1 char ≈ 1 token (rare chars up to 2); for latin text 1
+ *  token ≈ 4 chars — so a char budget never underestimates tokens, and each
+ *  request stays under the server's physical batch (token) limit. */
+const HTTP_BATCH_MAX_CHARS = 20000;
+
+/** Ceiling for a single input's length in chars. The local ONNX path
+ *  truncates every chunk to ~512 tokens; the HTTP path must also cap long
+ *  chunks — otherwise one over-long chunk (50-line md chunk ≈ 20k+ chars)
+ *  alone can exceed the server's physical batch even when it is the only
+ *  text in the request. */
+const HTTP_MAX_CHARS = 8000;
+
 async function embedHttp(texts: string[]): Promise<number[][]> {
-  const resp = await fetch(`${EMBED_URL}/v1/embeddings`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: EMBED_HTTP_MODEL, input: texts }),
-  });
-  if (!resp.ok) {
-    throw new Error(`RAG_EMBED_URL ${EMBED_URL} returned ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  const out: number[][] = [];
+  let batch: string[] = [];
+  let batchChars = 0;
+
+  const flush = async () => {
+    if (batch.length === 0) return;
+    const resp = await fetch(`${EMBED_URL}/v1/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: EMBED_HTTP_MODEL, input: batch }),
+    });
+    if (!resp.ok) {
+      throw new Error(`RAG_EMBED_URL ${EMBED_URL} returned ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+    }
+    const data = (await resp.json()) as { data?: Array<{ embedding?: number[] }> };
+    for (const item of data.data ?? []) {
+      out.push(normalizeL2((item.embedding ?? []).slice(0, VECTOR_DIM)));
+    }
+    batch = [];
+    batchChars = 0;
+  };
+
+  for (const t of texts) {
+    const clipped = t.length > HTTP_MAX_CHARS ? t.slice(0, HTTP_MAX_CHARS) : t;
+    if (batch.length > 0 && batchChars + clipped.length > HTTP_BATCH_MAX_CHARS) await flush();
+    batch.push(clipped);
+    batchChars += clipped.length;
   }
-  const data = (await resp.json()) as { data?: Array<{ embedding?: number[] }> };
-  return (data.data ?? []).map(item => normalizeL2((item.embedding ?? []).slice(0, VECTOR_DIM)));
+  await flush();
+  return out;
 }
 
 

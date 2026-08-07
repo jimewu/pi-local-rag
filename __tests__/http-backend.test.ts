@@ -93,6 +93,16 @@ describe("HTTP embedding/rerank backend (RAG_EMBED_URL / RAG_RERANK_URL)", () =>
     expect(isRerankerEnabled()).toBe(true);
   });
 
+  it("splits large token loads into multiple HTTP requests (ctx budget guard)", async () => {
+    const before = embedRequests.length;
+    const { embedTexts } = await import("../embed.ts");
+    // 10 long CJK texts ≈ 10 × 3600 est. tokens — must split into ≥2 requests.
+    const texts = Array.from({ length: 10 }, (_, i) => "臨床評估報告內容片段".repeat(300) + ` ${i}`);
+    const vecs = await embedTexts(texts);
+    expect(vecs.length).toBe(10);
+    expect(embedRequests.length - before).toBeGreaterThanOrEqual(2);
+  });
+
   it("errors surface when the server is unreachable", async () => {
     // Point at a closed port (the fake server is still listening, so use an
     // invalid URL on a different module instance).

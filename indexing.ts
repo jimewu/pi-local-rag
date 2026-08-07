@@ -152,9 +152,6 @@ export async function indexFiles(
           continue;
         }
 
-        repo.deleteVectorsForFile(database, r.fp);
-        repo.deleteChunksForFile(database, r.fp);
-
         const fileKey = sha256(r.fp);
         const rawParents = r.doc.parents.map(p => ({
           id: `${fileKey}-p-${p.lineStart}`,
@@ -229,12 +226,19 @@ export async function indexFiles(
     await flushGroup();
 
     // Phase 3: insert parents + children + vectors into DB
+    // Old chunks/vectors for a file are deleted INSIDE the transaction, right
+    // before the new ones are inserted. Deleting them earlier (during Phase 1
+    // read) would destroy existing index data if embedding fails later (e.g.
+    // an HTTP backend timeout) — Phase 3 never runs on error, so the previous
+    // index stays intact.
     let chunked = 0;
     const indexedAt = new Date().toISOString();
     const tx = database.transaction(() => {
       for (const fw of toIndex) {
         const vectors = fw._vectors;
         const fileKey = sha256(fw.fp);
+        repo.deleteVectorsForFile(database, fw.fp);
+        repo.deleteChunksForFile(database, fw.fp);
         for (const p of fw.rawParents) {
           repo.insertParent(database, {
             id: p.id,
