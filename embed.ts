@@ -17,6 +17,13 @@ const EMBED_HTTP_MODEL = process.env.RAG_EMBED_MODEL ?? "qwen3-embedding-4b";
 const RERANK_HTTP_MODEL = process.env.RAG_RERANK_MODEL ?? "qwen3-reranker-4b";
 
 
+/** The embedding model actually in use — the HTTP backend's model name when
+ *  RAG_EMBED_URL is set, otherwise the local ONNX model. Used for index
+ *  metadata so status shows the real embedder. */
+export function activeEmbeddingModel(): string {
+  return EMBED_URL ? EMBED_HTTP_MODEL : EMBEDDING_MODEL;
+}
+
 /** L2-normalize a vector. Local ONNX output is already normalized; HTTP
  *  backends return full-width (e.g. 2560-dim) normalized vectors whose
  *  MRL-truncated sub-vector must be re-normalized before storage. */

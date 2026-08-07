@@ -2,8 +2,7 @@ import { basename } from "node:path";
 import { realpathSync } from "node:fs";
 import Database from "better-sqlite3";
 import { getDbConn, type IndexStats } from "./db.ts";
-import { EMBEDDING_MODEL } from "./constants.ts";
-import { embedBatch } from "./embed.ts";
+import { embedBatch, activeEmbeddingModel } from "./embed.ts";
 import { chunkForFile, extractText, sha256, type ChunkedDoc } from "./chunking.ts";
 import * as repo from "./repository.ts";
 
@@ -275,7 +274,7 @@ export async function indexFiles(
     if (!hadCallbacks) process.stderr.write(`\r\x1b[2K`);
     progress?.onSave?.();
     repo.setMetadata(database, repo.MetadataKey.LastBuild, new Date().toISOString());
-    repo.setMetadata(database, repo.MetadataKey.EmbeddingModel, EMBEDDING_MODEL);
+    repo.setMetadata(database, repo.MetadataKey.EmbeddingModel, activeEmbeddingModel());
 
     return { indexed: toIndex.length, chunks: chunked, skipped, durationMs: Date.now() - startMs };
   } finally {
