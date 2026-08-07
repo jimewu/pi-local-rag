@@ -137,6 +137,22 @@ export function initSchema(db: Database.Database) {
     `);
   }
 
+  // Vector-dimension drift: if the configured embedding model changed after
+  // the vec table was created (e.g. RAG_EMBEDDING_DIM differs from the stored
+  // float[N] shape), queries fail with "Dimension mismatch". Detect it from
+  // the table SQL and rebuild the vec table + mark files for re-embedding.
+  const vecSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_vec'").get() as
+    | { sql?: string }
+    | undefined)?.sql;
+  const storedDim = vecSql?.match(/float\[(\d+)\]/)?.[1];
+  if (storedDim && Number(storedDim) !== VECTOR_DIM) {
+    db.exec(`
+      DROP TABLE chunks_vec;
+      CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[${VECTOR_DIM}]);
+    `);
+    db.prepare("UPDATE files SET embedded = 0").run();
+  }
+
   db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
 }
 
