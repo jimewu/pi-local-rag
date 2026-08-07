@@ -38,6 +38,8 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
+import { Box, Text } from "@mariozechner/pi-tui";
+import type { CoverageReport } from "./coverage.ts";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
 import { resolve, extname, basename, relative } from "node:path";
@@ -84,6 +86,60 @@ export type { ProgressCallbacks } from "./indexing.ts";
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // ── Register entry renderer for /rag coverage output (renders in transcript) ──
+  pi.registerEntryRenderer<CoverageReport>("rag-coverage", (entry, { expanded }, theme) => {
+    const report = entry.data ?? { verdict: "complete" as const, markdown: { total: 0, indexed: 0, missing: [], modified: [] }, documents: { total: 0, needs_convert: 0, checksum_missing: 0, up_to_date: 0 }, index: { chunks: 0, tokens: 0, vectors: 0, vectorCoveragePct: 0, lastBuild: "", stale: false } };
+    const th = theme;
+    const box = new Box(1, 1, (s) => th.bg("customMessageBg", s));
+
+    const addLine = (text: string) => { box.addChild(new Text(text, 0, 0)); };
+    const addEmpty = () => { box.addChild(new Text("", 0, 0)); };
+
+    addLine(th.bold("🧭 RAG coverage") + th.fg("dim", `  ${report.root || ""}`));
+    addEmpty();
+    addLine(th.bold(report.verdict === "complete" ? th.fg("success", "✅ " + coverageVerdictLabel(report.verdict)) : th.fg("warning", coverageVerdictLabel(report.verdict))));
+    addEmpty();
+    addLine(th.fg("dim", "  Markdown:") + `  ${report.markdown.indexed}/${report.markdown.total} indexed` +
+      (report.markdown.missing.length ? th.fg("warning", `  · ${report.markdown.missing.length} missing`) : "") +
+      (report.markdown.modified.length ? th.fg("warning", `  · ${report.markdown.modified.length} modified`) : ""));
+    addLine(th.fg("dim", "  Documents:") + `  ${report.documents.total} total` +
+      th.fg("warning", `  · ${report.documents.needs_convert} needs convert`) +
+      th.fg("muted", `  · ${report.documents.checksum_missing} checksum missing`) +
+      th.fg("success", `  · ${report.documents.up_to_date} up to date`));
+    addLine(th.fg("dim", "  Index:") + `  ${report.index.chunks} chunks / ${report.index.vectors} vectors (${report.index.vectorCoveragePct}%)` +
+      (report.index.stale ? th.fg("warning", "  · STALE") : th.fg("success", "  · fresh")));
+
+    if (report.markdown.missing.length) {
+      addEmpty();
+      addLine(th.fg("warning", "  Missing md:"));
+      for (const m of report.markdown.missing.slice(0, expanded ? undefined : 8)) {
+        addLine("    " + th.fg("dim", m));
+      }
+      if (report.markdown.missing.length > 8) {
+        addLine(th.fg("dim", `    … and ${report.markdown.missing.length - 8} more`));
+      }
+      addLine(th.fg("dim", "  → run /rag index . (or /rag refresh)"));
+    }
+    if (report.markdown.modified.length) {
+      addEmpty();
+      addLine(th.fg("warning", "  Modified md:"));
+      for (const m of report.markdown.modified.slice(0, expanded ? undefined : 8)) {
+        addLine("    " + th.fg("dim", m));
+      }
+      addLine(th.fg("dim", "  → run /rag refresh"));
+    }
+    if (report.documents.needs_convert || report.documents.checksum_missing) {
+      addEmpty();
+      addLine(th.fg("dim", "  → convert with convert-documents-to-markdown skill, then /rag mdsync"));
+    }
+    if ((entry.data as { timestamp?: number } | undefined)?.timestamp) {
+      addEmpty();
+      addLine(th.fg("dim", `Reported at ${new Date(entry.data!.timestamp!).toLocaleString()}`));
+    }
+
+    return box;
+  });
+
   // Throttle stale-index checks to once per hour so we don't repeatedly stat
   // the filesystem on every agent turn (matches the upstream fork's
   // lastStaleCheckMs pattern from kallewoof@849e485).
@@ -304,7 +360,7 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "coverage") {
         const config = loadConfig();
         const auto = parts.includes("--auto");
-        const pathArg = parts.find(p => !p.startsWith("-"));
+        const pathArg = parts.slice(1).find(p => !p.startsWith("-"));
         const target = pathArg ? resolve(pathArg) : config.trackedPaths[0] ?? process.cwd();
         if (!existsSync(target)) { ctx.ui.notify(`Path not found: ${target}`, "error"); return; }
 
@@ -317,40 +373,8 @@ export default function (pi: ExtensionAPI) {
         const report = auto
           ? (await autoCompleteCoverage(target, autoOpts)).after
           : await computeCoverage(target, { excludePatterns: config.excludePatterns });
-        const th = ctx.ui.theme;
-        const lines: string[] = [
-          th.bold("🧭 RAG coverage") + th.fg("dim", `  ${target}`),
-          "",
-          th.bold(report.verdict === "complete" ? th.fg("success", "✅ " + coverageVerdictLabel(report.verdict)) : th.fg("warning", coverageVerdictLabel(report.verdict))),
-          "",
-          th.fg("dim", "  Markdown:") + `  ${report.markdown.indexed}/${report.markdown.total} indexed` +
-            (report.markdown.missing.length ? th.fg("warning", `  · ${report.markdown.missing.length} missing`) : "") +
-            (report.markdown.modified.length ? th.fg("warning", `  · ${report.markdown.modified.length} modified`) : ""),
-          th.fg("dim", "  Documents:") + `  ${report.documents.total} total` +
-            th.fg("warning", `  · ${report.documents.needs_convert} needs convert`) +
-            th.fg("muted", `  · ${report.documents.checksum_missing} checksum missing`) +
-            th.fg("success", `  · ${report.documents.up_to_date} up to date`),
-          th.fg("dim", "  Index:") + `  ${report.index.chunks} chunks / ${report.index.vectors} vectors (${report.index.vectorCoveragePct}%)` +
-            (report.index.stale ? th.fg("warning", "  · STALE") : th.fg("success", "  · fresh")),
-        ];
-        if (report.markdown.missing.length) {
-          lines.push("", th.fg("warning", "  Missing md:"));
-          for (const m of report.markdown.missing.slice(0, 8)) lines.push("    " + th.fg("dim", m));
-          if (report.markdown.missing.length > 8) lines.push(th.fg("dim", `    … and ${report.markdown.missing.length - 8} more`));
-          lines.push(th.fg("dim", "  → run /rag index . (or /rag refresh)"));
-        }
-        if (report.markdown.modified.length) {
-          lines.push("", th.fg("warning", "  Modified md:"));
-          for (const m of report.markdown.modified.slice(0, 8)) lines.push("    " + th.fg("dim", m));
-          lines.push(th.fg("dim", "  → run /rag refresh"));
-        }
-        if (report.documents.needs_convert || report.documents.checksum_missing) {
-          lines.push("", th.fg("dim", "  → convert with convert-documents-to-markdown skill, then /rag mdsync"));
-        }
-        if (auto) {
-          lines.push("", th.fg("dim", "  (--auto ran: missing md indexed, checksums written, documents converted via anydoc/OCR)"));
-        }
-        ctx.ui.setWidget("rag-coverage", lines);
+
+        pi.appendEntry<CoverageReport>("rag-coverage", { ...report, timestamp: Date.now() });
         return;
       }
 
