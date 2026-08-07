@@ -39,8 +39,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { Box, Text } from "@mariozechner/pi-tui";
-import type { CoverageReport } from "./coverage.ts";
-import { Type } from "@sinclair/typebox";
+import type { CoverageReport } from "./coverage.ts";import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
 import { resolve, extname, basename, relative } from "node:path";
 import ignore from "ignore";
@@ -85,11 +84,44 @@ export type { ProgressCallbacks } from "./indexing.ts";
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
+/** Data stored in a /rag coverage transcript entry (report + reported-at time). */
+interface CoverageEntry extends CoverageReport {
+  timestamp: number;
+}
+
+/** Minimal theme surface consumed by the coverage entry renderer. The runtime
+ *  resolves @mariozechner/* to @earendil-works/* (pi's extension loader
+ *  aliases), which provides the full Theme; the npm-resolved typings in
+ *  node_modules predate registerEntryRenderer, so this is declared locally. */
+interface EntryRendererTheme {
+  fg(color: string, text: string): string;
+  bg(color: string, text: string): string;
+  bold(text: string): string;
+}
+
+/** Runtime-only ExtensionAPI surface: registerEntryRenderer ships with
+ *  @earendil-works/pi-coding-agent and is aliased into @mariozechner/* at
+ *  load time, but is absent from the old npm typings. Guarded by a runtime
+ *  typeof check so older pi versions still load the extension. */
+interface ExtensionAPICompat extends ExtensionAPI {
+  registerEntryRenderer<T>(
+    customType: string,
+    renderer: (entry: { data?: T }, options: { expanded: boolean }, theme: EntryRendererTheme) => unknown,
+  ): void;
+}
+
 export default function (pi: ExtensionAPI) {
   // ── Register entry renderer for /rag coverage output (renders in transcript) ──
-  pi.registerEntryRenderer<CoverageReport>("rag-coverage", (entry, { expanded }, theme) => {
-    const report = entry.data ?? { verdict: "complete" as const, markdown: { total: 0, indexed: 0, missing: [], modified: [] }, documents: { total: 0, needs_convert: 0, checksum_missing: 0, up_to_date: 0 }, index: { chunks: 0, tokens: 0, vectors: 0, vectorCoveragePct: 0, lastBuild: "", stale: false } };
-    const th = theme;
+  const api = pi as ExtensionAPICompat;
+  if (api.registerEntryRenderer) {
+    api.registerEntryRenderer<CoverageEntry>("rag-coverage", (entry, { expanded }, th) => {
+    const report = entry.data ?? {
+      root: "", verdict: "complete" as const,
+      markdown: { total: 0, indexed: 0, missing: [], modified: [] },
+      documents: { total: 0, needs_convert: 0, checksum_missing: 0, up_to_date: 0 },
+      index: { chunks: 0, tokens: 0, vectors: 0, vectorCoveragePct: 0, lastBuild: "", stale: false },
+      timestamp: Date.now(),
+    };
     const box = new Box(1, 1, (s) => th.bg("customMessageBg", s));
 
     const addLine = (text: string) => { box.addChild(new Text(text, 0, 0)); };
@@ -132,13 +164,14 @@ export default function (pi: ExtensionAPI) {
       addEmpty();
       addLine(th.fg("dim", "  → convert with convert-documents-to-markdown skill, then /rag mdsync"));
     }
-    if ((entry.data as { timestamp?: number } | undefined)?.timestamp) {
+    if (report.timestamp) {
       addEmpty();
-      addLine(th.fg("dim", `Reported at ${new Date(entry.data!.timestamp!).toLocaleString()}`));
+      addLine(th.fg("dim", `Reported at ${new Date(report.timestamp).toLocaleString()}`));
     }
 
     return box;
-  });
+    });
+  }
 
   // Throttle stale-index checks to once per hour so we don't repeatedly stat
   // the filesystem on every agent turn (matches the upstream fork's
@@ -374,7 +407,7 @@ export default function (pi: ExtensionAPI) {
           ? (await autoCompleteCoverage(target, autoOpts)).after
           : await computeCoverage(target, { excludePatterns: config.excludePatterns });
 
-        pi.appendEntry<CoverageReport>("rag-coverage", { ...report, timestamp: Date.now() });
+        pi.appendEntry<CoverageEntry>("rag-coverage", { ...report, timestamp: Date.now() });
         return;
       }
 

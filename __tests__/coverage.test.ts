@@ -3,7 +3,7 @@
  * index freshness, and verdict priority.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -105,5 +105,29 @@ describe("computeCoverage", () => {
     const report = await computeCoverage(root, { db });
     expect(report.index.stale).toBe(true);
     expect(report.verdict).toBe("stale");
+  });
+
+  it("matches indexed files when the scan root is a symlink alias of the stored path", async () => {
+    // Regression: index paths stored under a symlinked alias (e.g.
+    // /Documents → ) must still be
+    // recognized when coverage scans via the other alias — plain string
+    // startsWith() comparison would report every file as missing.
+    const realRoot = mkdtempSync(join(tmpdir(), "rag-cov-real-"));
+    const alias = join(tmpdir(), `rag-cov-alias-${Date.now()}`);
+    try {
+      mkdirSync(join(realRoot, "docs"), { recursive: true });
+      writeFileSync(join(realRoot, "docs", "a.md"), "# A\n\n量測裝置內容");
+      symlinkSync(realRoot, alias, "dir");
+      // Index via the real path — the DB stores real-path entries.
+      await indexFiles([join(realRoot, "docs", "a.md")], {}, db);
+      // Scan via the symlinked alias — must still match by realpath.
+      const report = await computeCoverage(alias, { db });
+      expect(report.markdown.missing.length).toBe(0);
+      expect(report.markdown.modified.length).toBe(0);
+      expect(report.verdict).not.toBe("needs_index");
+    } finally {
+      rmSync(alias, { recursive: true, force: true });
+      rmSync(realRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -1310,6 +1310,7 @@ describe("before_agent_start: 24h auto-refresh", () => {
       registerCommand: () => {},
       registerTool: () => {},
       registerFlag: () => {},
+      registerEntryRenderer: () => {},
       sendMessage: () => {},
       getFlag: () => undefined,
     };

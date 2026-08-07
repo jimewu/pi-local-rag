@@ -9,7 +9,7 @@
  * Verdict priority: needs_convert > needs_checksum > needs_index > stale >
  * complete. The command/tool counterpart is `/rag coverage` / `rag_coverage`.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { relative } from "node:path";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
@@ -61,6 +61,17 @@ function textSha256(fp: string): string {
   return createHash("sha256").update(readFileSync(fp, "utf-8")).digest("hex").slice(0, 12);
 }
 
+/** Resolve symlinks (e.g. /Documents → )
+ *  so index paths and scanned paths compare as the same physical file.
+ *  Falls back to the input path when it no longer exists. */
+function realOf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
 export async function computeCoverage(
   root: string,
   opts: { excludePatterns?: string[]; db?: Database.Database } = {},
@@ -70,18 +81,24 @@ export async function computeCoverage(
 
   // 1. markdown vs index
   const mdFiles = collectFiles(root, undefined, exclude);
-  const indexed = new Set(repo.listFilePaths(db));
-  const inRoot = (p: string) => p.startsWith(root);
-  const indexedSet = new Set([...indexed].filter(inRoot));
+  // Index paths may be stored under a symlinked alias of `root` (e.g.
+  // /Documents → ). Compare by resolved
+  // realpath so the same physical file isn't reported as missing.
+  const indexedByReal = new Map<string, string>();
+  for (const p of repo.listFilePaths(db)) {
+    const real = realOf(p);
+    if (!indexedByReal.has(real)) indexedByReal.set(real, p);
+  }
 
   const missing: string[] = [];
   const modified: string[] = [];
   for (const fp of mdFiles) {
-    if (!indexedSet.has(fp)) {
+    const dbPath = indexedByReal.get(realOf(fp));
+    if (dbPath === undefined) {
       missing.push(fp);
       continue;
     }
-    const rec = repo.getFile(db, fp);
+    const rec = repo.getFile(db, dbPath);
     if (rec?.hash && rec.hash !== textSha256(fp)) modified.push(fp);
   }
 
