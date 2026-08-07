@@ -19,12 +19,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
+import { getRagDir } from "./store.ts";
 import { collectFiles } from "./chunking.ts";
 import { mdTargetFor, scanMarkdownSync, sha256File } from "./md-sync.ts";
 import { DOC_CONVERT_EXTS } from "./constants.ts";
 import { computeCoverage, type CoverageReport } from "./coverage.ts";
 import { indexFiles } from "./indexing.ts";
-import { getDbConn } from "./db.ts";
+import { getFreshDbConn } from "./db.ts";
 
 const execFileP = promisify(execFile);
 
@@ -131,53 +132,63 @@ export async function autoCompleteCoverage(
   onProgress?: (msg: string) => void,
 ): Promise<AutoFixOutcome> {
   const exclude = opts.excludePatterns ?? [];
-  const db = getDbConn();
-  const before = await computeCoverage(root, { excludePatterns: exclude, db });
-  const actions: AutoFixResult = { indexed: [], indexFailed: [], checksummed: [], converted: [], failed: [] };
+  // Auto-complete writes to the knowledge base — the store MUST live under
+  // the repo root: anchor at `root` via startDir and open a dedicated
+  // connection. Never silently fall back to the global ~/.pi/rag store, and
+  // never create it under process.cwd() when the caller passed a different
+  // root. The connection is closed when the cycle finishes.
+  const ragDir = getRagDir({ createIfMissing: true, startDir: root });
+  const db = getFreshDbConn(ragDir);
+  try {
+    const before = await computeCoverage(root, { excludePatterns: exclude, db });
+    const actions: AutoFixResult = { indexed: [], indexFailed: [], checksummed: [], converted: [], failed: [] };
 
-  // 1) checksum missing → record current source hash (trusts existing md)
-  const docs = collectFiles(root, DOC_CONVERT_EXTS, exclude);
-  const sync = await scanMarkdownSync(docs);
-  for (let i = 0; i < sync.checksum_missing.length; i++) {
-    const s = sync.checksum_missing[i]!;
-    onProgress?.(`checksum ${i + 1}/${sync.checksum_missing.length} ${basename(s.file)}`);
-    try {
-      await writeChecksum(s.file, s.checksumFile);
-      actions.checksummed.push(s.file);
-    } catch (e) {
-      actions.failed.push({ file: s.file, reason: `checksum failed: ${String(e)}` });
+    // 1) checksum missing → record current source hash (trusts existing md)
+    const docs = collectFiles(root, DOC_CONVERT_EXTS, exclude);
+    const sync = await scanMarkdownSync(docs);
+    for (let i = 0; i < sync.checksum_missing.length; i++) {
+      const s = sync.checksum_missing[i]!;
+      onProgress?.(`checksum ${i + 1}/${sync.checksum_missing.length} ${basename(s.file)}`);
+      try {
+        await writeChecksum(s.file, s.checksumFile);
+        actions.checksummed.push(s.file);
+      } catch (e) {
+        actions.failed.push({ file: s.file, reason: `checksum failed: ${String(e)}` });
+      }
     }
-  }
 
-  // 2) needs_convert → convert each document
-  for (let i = 0; i < sync.needs_convert.length; i++) {
-    const s = sync.needs_convert[i]!;
-    onProgress?.(`convert ${i + 1}/${sync.needs_convert.length} ${basename(s.file)}`);
-    const r = await convertOneDocument(s.file, opts);
-    if (r.ok) actions.converted.push({ file: s.file, tool: r.tool! });
-    else actions.failed.push({ file: s.file, reason: r.reason ?? "convert failed" });
-  }
-
-  // 3) index everything (missing + modified + freshly converted). Full walk
-  //    with the hash-skip cache is cheap; it also covers the stale case.
-  const mdFiles = collectFiles(root, undefined, exclude);
-  if (mdFiles.length) {
-    try {
-      await indexFiles(mdFiles, {
-        onFile(current, total, filename, skipped) {
-          onProgress?.(`indexing ${current}/${total} ${filename}${skipped ? ` · ${skipped} skipped` : ""}`);
-        },
-        onEmbed(done, total) {
-          onProgress?.(`embedding ${done}/${total} chunks`);
-        },
-      }, db);
-      actions.indexed = mdFiles;
-    } catch (e) {
-      actions.indexFailed = mdFiles;
-      actions.failed.push({ file: root, reason: `index failed: ${String(e)}` });
+    // 2) needs_convert → convert each document
+    for (let i = 0; i < sync.needs_convert.length; i++) {
+      const s = sync.needs_convert[i]!;
+      onProgress?.(`convert ${i + 1}/${sync.needs_convert.length} ${basename(s.file)}`);
+      const r = await convertOneDocument(s.file, opts);
+      if (r.ok) actions.converted.push({ file: s.file, tool: r.tool! });
+      else actions.failed.push({ file: s.file, reason: r.reason ?? "convert failed" });
     }
-  }
 
-  const after = await computeCoverage(root, { excludePatterns: exclude, db });
-  return { before, actions, after };
+    // 3) index everything (missing + modified + freshly converted). Full walk
+    //    with the hash-skip cache is cheap; it also covers the stale case.
+    const mdFiles = collectFiles(root, undefined, exclude);
+    if (mdFiles.length) {
+      try {
+        await indexFiles(mdFiles, {
+          onFile(current, total, filename, skipped) {
+            onProgress?.(`indexing ${current}/${total} ${filename}${skipped ? ` · ${skipped} skipped` : ""}`);
+          },
+          onEmbed(done, total) {
+            onProgress?.(`embedding ${done}/${total} chunks`);
+          },
+        }, db);
+        actions.indexed = mdFiles;
+      } catch (e) {
+        actions.indexFailed = mdFiles;
+        actions.failed.push({ file: root, reason: `index failed: ${String(e)}` });
+      }
+    }
+
+    const after = await computeCoverage(root, { excludePatterns: exclude, db });
+    return { before, actions, after };
+  } finally {
+    db.close();
+  }
 }

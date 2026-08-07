@@ -435,6 +435,9 @@ export default function (pi: ExtensionAPI) {
         const rebuildArgs = parts.slice(1);
         const force = rebuildArgs.includes("--force");
 
+        // Anchor the store at the repo (cwd) — rebuild writes the index and
+        // must never silently fall back to the global ~/.pi/rag store.
+        getRagDir({ createIfMissing: true });
         const database = getDbConn();
         const config = loadConfig();
         try {
@@ -536,6 +539,9 @@ export default function (pi: ExtensionAPI) {
 
       // ── refresh (on-demand equivalent of the 24h auto-refresh) ──
       if (cmd === "refresh") {
+        // Anchor the store at the repo (cwd) — refresh writes the index and
+        // must never silently fall back to the global ~/.pi/rag store.
+        getRagDir({ createIfMissing: true });
         const config = loadConfig();
         const index = loadIndex();
         const files = config.trackedPaths.length

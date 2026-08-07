@@ -16,17 +16,17 @@ export function setRagDirGetter(getter: () => string | undefined): void {
 }
 
 /**
- * Resolve the active RAG store directory for the current cwd.
+ * Resolve the active RAG store directory.
  *
  * 1. `--rag-dir` CLI flag — explicit override, wins over everything.
  * 2. `$PI_RAG_DIR` — environment variable override.
- * 3. Walk upward from `process.cwd()` looking for an existing `.pi/rag/`,
- *    stopping before `homedir()` so the global store at `~/.pi/rag/` is only
- *    reached as an explicit fallback (not via walk-up).
- * 4. With `createIfMissing`, create `${cwd}/.pi/rag/`.
+ * 3. Walk upward from `startDir` (default `process.cwd()`) looking for an
+ *    existing `.pi/rag/`, stopping before `homedir()` so the global store at
+ *    `~/.pi/rag/` is only reached as an explicit fallback (not via walk-up).
+ * 4. With `createIfMissing`, create `${startDir}/.pi/rag/`.
  * 5. Otherwise, fall back to `${homedir()}/.pi/rag/`.
  */
-export function getRagDir(opts: { createIfMissing?: boolean } = {}): string {
+export function getRagDir(opts: { createIfMissing?: boolean; startDir?: string } = {}): string {
   // CLI flag takes highest priority
   // Check getter first — resolves lazily on first actual use
   const flagDir = _ragDirGetter?.();
@@ -40,7 +40,8 @@ export function getRagDir(opts: { createIfMissing?: boolean } = {}): string {
     return override;
   }
   const home = homedir();
-  let dir = process.cwd();
+  const start = opts.startDir ?? process.cwd();
+  let dir = start;
   // Walk-up search, stopping before $HOME so we don't accidentally pick up
   // ~/.pi/rag via the walk (that path is reached only as the explicit
   // fallback below).
@@ -53,7 +54,9 @@ export function getRagDir(opts: { createIfMissing?: boolean } = {}): string {
     dir = parent;
   }
   if (opts.createIfMissing) {
-    const local = join(process.cwd(), ".pi", "rag");
+    // Anchor at startDir (the knowledge-base root), NOT process.cwd() — a
+    // caller may pass a repo root that differs from the working directory.
+    const local = join(start, ".pi", "rag");
     mkdirSync(local, { recursive: true });
     return local;
   }

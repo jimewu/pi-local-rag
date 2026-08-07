@@ -21,7 +21,7 @@ import { RST, B, D, GREEN, YELLOW, RED } from "./constants.ts";
 import { DOC_CONVERT_EXTS } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig } from "./config.ts";
-import { getDbConn, closeDbConn, loadIndex, getIndexStats } from "./db.ts";
+import { getDbConn, getFreshDbConn, closeDbConn, loadIndex, getIndexStats } from "./db.ts";
 import { collectFiles } from "./chunking.ts";
 import { scanMarkdownSync } from "./md-sync.ts";
 import { computeCoverage, coverageVerdictLabel, type CoverageReport } from "./coverage.ts";
@@ -225,8 +225,14 @@ export async function runAuto(root: string, opts: { json: boolean }): Promise<nu
     ocrCli: process.env.RAG_OCR_CLI || undefined,
     ocrApi: process.env.RAG_OCR_API || undefined,
   };
-  const db = getDbConn();
+  // The starting-state summary must read the same store the auto-complete
+  // writes to — anchored at the repo root, never the cwd-based singleton
+  // (which may point at a different store when --dir is used) and never the
+  // global fallback.
+  const ragDir = getRagDir({ createIfMissing: true, startDir: root });
+  const db = getFreshDbConn(ragDir);
   const before = await computeCoverage(root, { excludePatterns: config.excludePatterns, db });
+  db.close();
   if (opts.json) {
     // JSON mode: quiet progress (stderr), full outcome object at the end.
     const outcome = await autoCompleteCoverage(root, autoOpts);

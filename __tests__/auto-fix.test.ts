@@ -168,4 +168,27 @@ describe("autoCompleteCoverage", () => {
     // conversion, indexing, embedding).
     expect(msgs.some(m => /^(checksum|convert|indexing|embedding)/.test(m))).toBe(true);
   });
+
+  it("anchors the store under the repo root even when cwd has no store", async () => {
+    // Regression: when .pi/rag is missing, auto-complete must create it at
+    // the repo root (root/.pi/rag) — never the global ~/.pi/rag store, and
+    // never under process.cwd() when the caller passes a different root.
+    const savedCwd = process.cwd();
+    const cwd = mkdtempSync(join(tmpdir(), "rag-cwd-"));
+    try {
+      process.chdir(cwd);
+      setRagDirGetter(() => undefined); // let the startDir anchor take effect
+      const outcome = await autoCompleteCoverage(root, { runner: fakeAnydocRunner({ root }) });
+      expect(outcome.after.verdict).toBe("complete");
+      expect(existsSync(join(root, ".pi", "rag", "rag.db"))).toBe(true);
+      // Nothing was created under the unrelated cwd.
+      expect(existsSync(join(cwd, ".pi", "rag"))).toBe(false);
+      // And the real global store was not touched.
+      const { GLOBAL_RAG_DIR } = await import("../store.ts");
+      expect(existsSync(join(GLOBAL_RAG_DIR(), "rag.db"))).toBe(false);
+    } finally {
+      process.chdir(savedCwd);
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
