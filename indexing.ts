@@ -1,4 +1,5 @@
 import { basename } from "node:path";
+import { realpathSync } from "node:fs";
 import Database from "better-sqlite3";
 import { getDbConn, type IndexStats } from "./db.ts";
 import { EMBEDDING_MODEL } from "./constants.ts";
@@ -23,6 +24,17 @@ export function isIndexStale(index: IndexStats, maxAgeMs = 24 * 60 * 60 * 1000):
 }
 
 const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
+
+/** Resolve symlinks so path comparisons survive aliased paths (e.g.
+ *  /Documents → ). Falls back to the
+ *  input when the file no longer exists. */
+function realOf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
 
 let _suppressStderr = false;
 
@@ -72,6 +84,16 @@ export async function indexFiles(
       return { indexed: 0, chunks: 0, skipped: 0, durationMs: Date.now() - startMs };
     }
 
+    // Map resolved realpaths → DB-side stored paths so the hash-skip check
+    // survives symlinked aliases: a file indexed under one alias (e.g.
+    // /…) is skipped when scanned via the other (/…)
+    // instead of being fully re-read and re-embedded.
+    const realToDb = new Map<string, string>();
+    for (const p of repo.listFilePaths(database)) {
+      const real = realOf(p);
+      if (!realToDb.has(real)) realToDb.set(real, p);
+    }
+
     // Phase 1: parallel read + chunk; DB ops on main thread
     const CONCURRENCY = 32;
     const YIELD_INTERVAL = 64;
@@ -118,7 +140,12 @@ export async function indexFiles(
         processedCount++;
         const name = basename(r.fp);
 
-        const existing = repo.getFile(database, r.fp);
+        let existing = repo.getFile(database, r.fp);
+        if (!existing) {
+          // The DB may store this file under a symlinked alias of r.fp.
+          const dbPath = realToDb.get(realOf(r.fp));
+          if (dbPath && dbPath !== r.fp) existing = repo.getFile(database, dbPath);
+        }
         if (!force && existing?.hash === r.hash && existing?.embedded) {
           skipped++;
           progress?.onFile?.(processedCount, total, name, skipped);

@@ -143,4 +143,19 @@ describe("autoCompleteCoverage", () => {
     expect(outcome.actions.converted[0].tool).toBe("anydoc");
     expect(outcome.after.verdict).toBe("complete");
   });
+
+  it("streams progress updates via the onProgress callback", async () => {
+    const docx = join(root, "docs", "r.docx");
+    writeFileSync(docx, "PK stub");
+    const stem = docx.replace(/\.docx$/, "");
+    mkdirSync(stem, { recursive: true });
+    writeFileSync(join(stem, "r.md"), "# R\n\n已轉檔。");
+
+    const msgs: string[] = [];
+    await autoCompleteCoverage(root, { runner: fakeAnydocRunner({ root }) }, (m) => msgs.push(m));
+    expect(msgs.length).toBeGreaterThan(0);
+    // Progress covers at least one of the long-running phases (checksum,
+    // conversion, indexing, embedding).
+    expect(msgs.some(m => /^(checksum|convert|indexing|embedding)/.test(m))).toBe(true);
+  });
 });

@@ -18,6 +18,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { basename } from "node:path";
 import { collectFiles } from "./chunking.ts";
 import { mdTargetFor, scanMarkdownSync, sha256File } from "./md-sync.ts";
 import { DOC_CONVERT_EXTS } from "./constants.ts";
@@ -117,10 +118,17 @@ export async function convertOneDocument(
   return { ok: false, reason: r.stderr || "conversion failed" };
 }
 
-/** Run the full auto-complete cycle and re-report coverage. */
+/** Run the full auto-complete cycle and re-report coverage.
+ *
+ *  `onProgress` (optional) receives human-readable status updates so the
+ *  caller can surface live progress — auto-completion converts documents and
+ *  re-embeds missing/changed markdown, which can take minutes with no other
+ *  feedback.
+ */
 export async function autoCompleteCoverage(
   root: string,
   opts: AutoFixOptions = {},
+  onProgress?: (msg: string) => void,
 ): Promise<AutoFixOutcome> {
   const exclude = opts.excludePatterns ?? [];
   const db = getDbConn();
@@ -130,7 +138,9 @@ export async function autoCompleteCoverage(
   // 1) checksum missing → record current source hash (trusts existing md)
   const docs = collectFiles(root, DOC_CONVERT_EXTS, exclude);
   const sync = await scanMarkdownSync(docs);
-  for (const s of sync.checksum_missing) {
+  for (let i = 0; i < sync.checksum_missing.length; i++) {
+    const s = sync.checksum_missing[i]!;
+    onProgress?.(`checksum ${i + 1}/${sync.checksum_missing.length} ${basename(s.file)}`);
     try {
       await writeChecksum(s.file, s.checksumFile);
       actions.checksummed.push(s.file);
@@ -140,7 +150,9 @@ export async function autoCompleteCoverage(
   }
 
   // 2) needs_convert → convert each document
-  for (const s of sync.needs_convert) {
+  for (let i = 0; i < sync.needs_convert.length; i++) {
+    const s = sync.needs_convert[i]!;
+    onProgress?.(`convert ${i + 1}/${sync.needs_convert.length} ${basename(s.file)}`);
     const r = await convertOneDocument(s.file, opts);
     if (r.ok) actions.converted.push({ file: s.file, tool: r.tool! });
     else actions.failed.push({ file: s.file, reason: r.reason ?? "convert failed" });
@@ -151,7 +163,14 @@ export async function autoCompleteCoverage(
   const mdFiles = collectFiles(root, undefined, exclude);
   if (mdFiles.length) {
     try {
-      await indexFiles(mdFiles, {}, db);
+      await indexFiles(mdFiles, {
+        onFile(current, total, filename, skipped) {
+          onProgress?.(`indexing ${current}/${total} ${filename}${skipped ? ` · ${skipped} skipped` : ""}`);
+        },
+        onEmbed(done, total) {
+          onProgress?.(`embedding ${done}/${total} chunks`);
+        },
+      }, db);
       actions.indexed = mdFiles;
     } catch (e) {
       actions.indexFailed = mdFiles;

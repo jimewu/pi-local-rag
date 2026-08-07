@@ -403,9 +403,18 @@ export default function (pi: ExtensionAPI) {
           ocrCli: env.RAG_OCR_CLI || undefined,
           ocrApi: env.RAG_OCR_API || undefined,
         };
+        if (auto) {
+          // Auto-completion converts documents and re-embeds markdown — that
+          // takes minutes. Give immediate feedback and stream progress to the
+          // footer status so it never looks like the command silently died.
+          ctx.ui.notify("⏳ /rag coverage --auto：正在補齊知識庫（轉檔+索引），進度顯示於底部狀態列，可能需要數分鐘…", "info");
+        }
         const report = auto
-          ? (await autoCompleteCoverage(target, autoOpts)).after
+          ? (await autoCompleteCoverage(target, autoOpts, (msg) => {
+              ctx.ui.setStatus("rag", `■ coverage --auto: ${msg}`);
+            })).after
           : await computeCoverage(target, { excludePatterns: config.excludePatterns });
+        if (auto) ctx.ui.setStatus("rag", undefined);
 
         pi.appendEntry<CoverageEntry>("rag-coverage", { ...report, timestamp: Date.now() });
         return;

@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from "vitest";
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync,
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync, symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, relative, basename } from "node:path";
@@ -561,6 +561,32 @@ describe("indexFiles --force", () => {
       expect(r3.indexed).toBe(1);
       expect(r3.skipped).toBe(0);
     } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
+
+  it("skips files indexed via a symlinked alias when scanned via the other alias", async () => {
+    // Regression: the DB stores paths as they were indexed (e.g.
+    // /Documents/… while scanning resolves to
+    // /…). The hash-skip check must resolve the
+    // alias so unchanged files are not fully re-read and re-embedded.
+    const proj = mkdtempSync(join(tmpdir(), "rag-force-proj-"));
+    const alias = join(tmpdir(), `rag-force-alias-${Date.now()}`);
+    try {
+      const real = join(proj, "stable.ts");
+      writeFileSync(real, "export const stable = 1;\n");
+      symlinkSync(proj, alias, "dir");
+
+      // Index via the real path.
+      const r1 = await mod.indexFiles([real]);
+      expect(r1.indexed).toBe(1);
+
+      // Re-index the same physical file via the symlinked alias: must skip.
+      const r2 = await mod.indexFiles([join(alias, "stable.ts")]);
+      expect(r2.skipped).toBe(1);
+      expect(r2.indexed).toBe(0);
+    } finally {
+      rmSync(alias, { recursive: true, force: true });
       rmSync(proj, { recursive: true, force: true });
     }
   });
