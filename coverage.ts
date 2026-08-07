@@ -10,7 +10,7 @@
  * complete. The command/tool counterpart is `/rag coverage` / `rag_coverage`.
  */
 import { readFileSync, realpathSync } from "node:fs";
-import { relative } from "node:path";
+import { dirname, relative } from "node:path";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { getDbConn } from "./db.ts";
@@ -72,6 +72,23 @@ function realOf(p: string): string {
   }
 }
 
+/** Longest directory path that every indexed path starts with — the repo
+ *  root as seen at index time. Walking up keeps the prefix on a directory
+ *  boundary (p equals it or continues with a separator). Returns undefined
+ *  when the paths share no common directory (e.g. an empty index). */
+function commonDirPrefix(paths: string[]): string | undefined {
+  if (!paths.length) return undefined;
+  let prefix = dirname(paths[0]!);
+  for (const p of paths) {
+    while (p !== prefix && !p.startsWith(prefix + "/") && !p.startsWith(prefix + "\\")) {
+      const parent = dirname(prefix);
+      if (parent === prefix) return undefined;
+      prefix = parent;
+    }
+  }
+  return prefix;
+}
+
 export async function computeCoverage(
   root: string,
   opts: { excludePatterns?: string[]; db?: Database.Database } = {},
@@ -81,19 +98,35 @@ export async function computeCoverage(
 
   // 1. markdown vs index
   const mdFiles = collectFiles(root, undefined, exclude);
-  // Index paths may be stored under a symlinked alias of `root` (e.g.
-  // /Documents → ). Compare by resolved
-  // realpath so the same physical file isn't reported as missing.
+  // A file's identity is compared on two levels so a moved/renamed repo
+  // directory doesn't flip the whole report to 0%:
+  //   1. resolved realpath — covers symlinked aliases of `root` (e.g.
+  //      /Documents → );
+  //   2. relative path from the repo root — covers relocating the whole
+  //      case repo: the db stores absolute paths from the old location,
+  //      but the path *relative to the repo root* is unchanged by the move.
+  const indexedPaths = repo.listFilePaths(db);
+  // Common-directory prefixes of both sides: the relative path between two
+  // files in the same tree is invariant under relocating that tree, so both
+  // sides are anchored at their own lowest common directory.
+  const dbRoot = commonDirPrefix(indexedPaths);
+  const mdRelRoot = commonDirPrefix(mdFiles) ?? root;
   const indexedByReal = new Map<string, string>();
-  for (const p of repo.listFilePaths(db)) {
+  const indexedByRel = new Map<string, string>();
+  for (const p of indexedPaths) {
     const real = realOf(p);
     if (!indexedByReal.has(real)) indexedByReal.set(real, p);
+    if (dbRoot) {
+      const rel = relative(dbRoot, p);
+      if (rel && !rel.startsWith("..") && !indexedByRel.has(rel)) indexedByRel.set(rel, p);
+    }
   }
 
   const missing: string[] = [];
   const modified: string[] = [];
   for (const fp of mdFiles) {
-    const dbPath = indexedByReal.get(realOf(fp));
+    const dbPath = indexedByReal.get(realOf(fp)) ??
+      (dbRoot ? indexedByRel.get(relative(mdRelRoot, fp)) : undefined);
     if (dbPath === undefined) {
       missing.push(fp);
       continue;

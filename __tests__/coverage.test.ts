@@ -3,7 +3,7 @@
  * index freshness, and verdict priority.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -107,7 +107,7 @@ describe("computeCoverage", () => {
     expect(report.verdict).toBe("stale");
   });
 
-  it("matches indexed files when the scan root is a symlink alias of the stored path", async () => {
+  it("matches indexed files after the scan root is a symlink alias of the stored path", async () => {
     // Regression: index paths stored under a symlinked alias (e.g.
     // /Documents → ) must still be
     // recognized when coverage scans via the other alias — plain string
@@ -128,6 +128,25 @@ describe("computeCoverage", () => {
     } finally {
       rmSync(alias, { recursive: true, force: true });
       rmSync(realRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("still matches indexed files after the repo directory is relocated", async () => {
+    // Regression: the DB stores absolute paths from where indexing ran; if
+    // the whole case repo is moved, scanned paths differ on every level
+    // except the path relative to the repo root. Matching by relative path
+    // keeps the report from flipping to 0% indexed after a move.
+    await indexFiles([join(root, "docs", "a.md"), join(root, "docs", "b.md")], {}, db);
+    const moved = join(tmpdir(), `rag-cov-moved-${Date.now()}`);
+    renameSync(root, moved);
+    try {
+      const report = await computeCoverage(moved, { db });
+      expect(report.markdown.missing.length).toBe(0);
+      expect(report.markdown.modified.length).toBe(0);
+      expect(report.markdown.indexed).toBe(report.markdown.total);
+      expect(report.verdict).not.toBe("needs_index");
+    } finally {
+      rmSync(moved, { recursive: true, force: true });
     }
   });
 });
