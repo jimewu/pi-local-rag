@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.6.1 (security)
+
+- **Scrubbed confidential case information from the entire git history**:
+  product identifiers, real document paths, and machine-specific paths were
+  replaced with generic placeholders across all commits (messages and file
+  blobs). History rewritten and force-pushed; existing clones must be
+  re-fetched/cloned.
+
 ## 0.5.6
 
 - **Metadata seed (`rag-metadata.json`)** — a version-controlled source of
