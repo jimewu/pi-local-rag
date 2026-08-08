@@ -32,17 +32,17 @@ embedding 與 reranking 可跑在本機 GPU 而非 CPU ONNX 管線。參考部�
 服務 **Qwen3-Embedding-4B** 與 **Qwen3-Reranker-4B**（GGUF，MTEB 多語頂尖、含中文）：
 
 ```yaml
-# /srv/llama-swap/config.yaml（節錄）
+# /opt/llama-swap/config.yaml（節錄）
 models:
   qwen3-embedding-4b:
     cmd: |
-      llama-server --model /srv/models/qwen3-embedding-4b/Qwen3-Embedding-4B-Q5_K_M.gguf
+      llama-server --model /opt/models/qwen3-embedding-4b/Qwen3-Embedding-4B-Q5_K_M.gguf
         --embeddings --pooling mean --ctx-size 16384 --batch-size 16384 --ubatch-size 16384
         --n-gpu-layers 99 --port ${PORT}
     ttl: 600          # idle 10 分鐘 → 此模型卸載，與另一模型無關
   qwen3-reranker-4b:
     cmd: |
-      llama-server --model /srv/models/qwen3-reranker-4b/Qwen3-Reranker-4B-Q5_K_M.gguf
+      llama-server --model /opt/models/qwen3-reranker-4b/Qwen3-Reranker-4B-Q5_K_M.gguf
         --reranking --ctx-size 32768 --batch-size 16384 --ubatch-size 16384
         --n-gpu-layers 99 --port ${PORT}
     ttl: 600
@@ -119,7 +119,7 @@ case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見
 改為把每檔案的 **metadata 標記**存入 FTS 索引（schema v3：`files.metadata` + `chunks_fts.metadata`）：
 
 ```bash
-/rag meta "1_初審資料/5_CER/CER MT V5 (20260310) Final.md" "PROD-A 系列 臨床評估報告 CER"
+/rag meta "docs/product-evaluation.md" "PROD-A series clinical evaluation report"
 /rag meta list          # 列出所有已標記檔案
 /rag meta <path>        # 顯示單一檔案的標記
 /rag meta -d <path>     # 清除
@@ -139,8 +139,8 @@ case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見
 
 ```json
 {
-  "1_初審資料/5_CER/CER MT V5 (20260310) Final.md": "PROD-A 系列 臨床評估報告 CER",
-  "2_FU1委員意見/…/MT TD …20260515 的複本.md": "PROD-A PROD-A FU1 審查意見"
+  "docs/product-evaluation.md": "PROD-A series clinical evaluation report",
+  "docs/review-questions.md": "PROD-A series review questions"
 }
 ```
 

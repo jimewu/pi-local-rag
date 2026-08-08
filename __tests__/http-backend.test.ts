@@ -92,7 +92,7 @@ describe("HTTP embedding/rerank backend (RAG_EMBED_URL / RAG_RERANK_URL)", () =>
     const before = rerankRequests.length;
     const { rerank } = await import("../embed.ts");
     // 10 long passages ≈ 10 × 3000 chars — must split into ≥2 requests.
-    const passages = Array.from({ length: 10 }, (_, i) => "臨床評估報告內容片段".repeat(250) + ` ${i}`);
+    const passages = Array.from({ length: 10 }, (_, i) => "evaluation report content".repeat(250) + ` ${i}`);
     const scores = (await rerank("量測裝置臨床評估", passages))!;
     expect(scores.length).toBe(10);
     expect(rerankRequests.length - before).toBeGreaterThanOrEqual(2);
@@ -109,7 +109,7 @@ describe("HTTP embedding/rerank backend (RAG_EMBED_URL / RAG_RERANK_URL)", () =>
     const before = embedRequests.length;
     const { embedTexts } = await import("../embed.ts");
     // 10 long CJK texts ≈ 10 × 3600 est. tokens — must split into ≥2 requests.
-    const texts = Array.from({ length: 10 }, (_, i) => "臨床評估報告內容片段".repeat(300) + ` ${i}`);
+    const texts = Array.from({ length: 10 }, (_, i) => "evaluation report content".repeat(300) + ` ${i}`);
     const vecs = await embedTexts(texts);
     expect(vecs.length).toBe(10);
     expect(embedRequests.length - before).toBeGreaterThanOrEqual(2);

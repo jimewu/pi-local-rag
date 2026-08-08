@@ -168,7 +168,7 @@ export async function hybridSearch(
       : bm25Final;
     // Metadata boost: +0.2 for chunks of files whose entity tags matched,
     // capped at 1. Keeps a metadata hit competitive against strong content
-    // hits (e.g. 'PROD-A 風險利益' surfaces the tagged questionnaire file).
+    // hits (e.g. 'PROD-A risk' surfaces the tagged questionnaire file).
     const boosted = metadataFiles.has(c.file_path) ? Math.min(1, hybrid + 0.2) : hybrid;
 
     scored.push({

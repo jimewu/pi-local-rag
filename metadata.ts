@@ -5,8 +5,8 @@
  * is version-controlled and travels with the repo):
  *
  *   {
- *     "1_初審資料/5_CER/CER MT V5 (20260310) Final.md": "PROD-A 系列 臨床評估報告 CER",
- *     "1_初審資料/4_風險利益問卷_by_子涵/9 Questionnaire ...20260307.md": "PROD-A 系列 風險利益問卷"
+ *     "docs/product-evaluation.md": "PROD-A series clinical evaluation report",
+ *     "docs/risk-questionnaire.md": "PROD-A series benefit-risk questionnaire"
  *   }
  *
  * Keys are paths relative to the repo root (stable across relocations);

@@ -34,17 +34,17 @@ through [`llama-swap`](https://github.com/mostlygeek/llama-swap) as a systemd
 service:
 
 ```yaml
-# /srv/llama-swap/config.yaml (excerpt)
+# /opt/llama-swap/config.yaml (excerpt)
 models:
   qwen3-embedding-4b:
     cmd: |
-      llama-server --model /srv/models/qwen3-embedding-4b/Qwen3-Embedding-4B-Q5_K_M.gguf
+      llama-server --model /opt/models/qwen3-embedding-4b/Qwen3-Embedding-4B-Q5_K_M.gguf
         --embeddings --pooling mean --ctx-size 16384 --batch-size 16384 --ubatch-size 16384
         --n-gpu-layers 99 --port ${PORT}
     ttl: 600          # idle 10 min → this model unloads, independently
   qwen3-reranker-4b:
     cmd: |
-      llama-server --model /srv/models/qwen3-reranker-4b/Qwen3-Reranker-4B-Q5_K_M.gguf
+      llama-server --model /opt/models/qwen3-reranker-4b/Qwen3-Reranker-4B-Q5_K_M.gguf
         --reranking --ctx-size 32768 --batch-size 16384 --ubatch-size 16384
         --n-gpu-layers 99 --port ${PORT}
     ttl: 600
@@ -124,7 +124,7 @@ opinions ↔ responses. Instead of a graph database, per-file **metadata tags** 
 stored in the FTS index (schema v3, `files.metadata` + `chunks_fts.metadata`):
 
 ```bash
-/rag meta "1_初審資料/5_CER/CER MT V5 (20260310) Final.md" "PROD-A 系列 臨床評估報告 CER"
+/rag meta "docs/product-evaluation.md" "PROD-A series clinical evaluation report"
 /rag meta list          # all tagged files
 /rag meta <path>        # show one file's tags
 /rag meta -d <path>     # clear
@@ -133,7 +133,7 @@ stored in the FTS index (schema v3, `files.metadata` + `chunks_fts.metadata`):
 
 How it works (方式 3): the tags become an FTS column, so a query hitting a tag
 (e.g. `PROD-A` — a product name that never appears in the file bodies) scores
-every chunk of that file via BM25, and `hybridSearch` boosts the tagged files'chunks. This makes cross-file lookups like “everything about product PROD-A”
+every chunk of that file via BM25, and `hybridSearch` boosts the tagged files' chunks. This makes cross-file lookups like “everything about product PROD-A”
 work with zero graph infrastructure. Re-indexing keeps existing tags (the
 `ON CONFLICT` upsert never overwrites `metadata`).
 
@@ -144,8 +144,8 @@ at the repo root — version-controlled and travels with the case repo:
 
 ```json
 {
-  "1_初審資料/5_CER/CER MT V5 (20260310) Final.md": "PROD-A 系列 臨床評估報告 CER",
-  "2_FU1委員意見/…/MT TD …20260515 的複本.md": "PROD-A PROD-A FU1 審查意見"
+  "docs/product-evaluation.md": "PROD-A series clinical evaluation report",
+  "docs/review-questions.md": "PROD-A series review questions"
 }
 ```
 

@@ -29,7 +29,7 @@
   hidden until pure-BM25 hits (a metadata-only match) exposed it
 - 4 new tests (schema v3, metadata-only BM25 hit, setFileMetadata
   propagation, upsert keeps tags); verified on the real case repo:
-  “PROD-A” now surfaces the tagged CER/risk-questionnaire files first
+  “PROD-A” now surfaces the tagged evaluation/risk-questionnaire files first
 
 ## 0.5.4
 
