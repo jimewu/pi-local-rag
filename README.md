@@ -17,10 +17,73 @@ Local hybrid RAG pipeline for the [Pi coding agent](https://github.com/badlogic/
 - **Parent-child chunking for markdown** — parent = one heading section (≤200 lines), child = paragraph/list/table/code block; a child hit recalls the **whole section** so answers are never taken out of context
 - **Markdown-only index** — the extension never ingests docx/pdf/xlsx/csv directly; it reports conversion state instead (see md-sync below)
 - **md-sync scanner** — `A/B.docx` → `A/B/B.md` + `A/B/B.docx.sha256`; recognizes the legacy `<stem>_ocr/<stem>.md` layout; flags `no_markdown` / `checksum_changed` / `checksum_missing`, collapses symlinked duplicates
-- **Per-project storage** — walks up from cwd looking for `.pi/rag/`; falls back to `~/.pi/rag/` global store
+- **Per-project storage** — walks up from cwd looking for `.pi/rag/`; falls back to `~/.pi/rag/` global store. Store creation during index/auto-complete is always anchored at the repo root — a deleted `.pi/rag/` is recreated inside the repo, never silently redirected to the global store
 - **Auto-refresh** — stale index (>24 h) silently refreshed before the next agent turn; manual `/rag refresh` for on-demand incremental updates
-- **Auto-injection** — relevant parent sections appended after the user prompt before every agent turn (KV-cache friendly)
-- **4 AI tools** — `rag_index`, `rag_query`, `rag_status`, `rag_md_sync`
+- **Auto-injection** — relevant parent sections appended after the user prompt before every agent turn (KV-cache friendly), with an instruction to answer from the retrieved context when it is sufficient (no redundant re-reading of repo files)
+- **GPU inference backend (optional)** — route embedding + reranking to a local [`llama-swap`](https://github.com/mostlygeek/llama-swap) server (Qwen3 GGUF on the AMD iGPU via Vulkan, ~3.3× CPU throughput) via `RAG_EMBED_URL` / `RAG_RERANK_URL`; models stay resident side-by-side and each **rotates independently** (unloaded after its own idle `ttl`, exactly like ollama keep_alive)
+- **Matryoshka (MRL) truncation** — HTTP backend outputs are truncated to `RAG_EMBEDDING_DIM` and re-normalized; Qwen3-Embedding-4B at 1024 dims keeps ≥97% retrieval quality vs full 2560
+- **4 AI tools** — `rag_index`, `rag_query`, `rag_status`, `rag_md_sync` (+ `rag_coverage`)
+
+## GPU inference backend (llama-swap)
+
+Embedding and reranking can run on the local GPU instead of the CPU ONNX
+pipeline. The reference setup serves **Qwen3-Embedding-4B** and
+**Qwen3-Reranker-4B** (GGUF, MTEB multilingual top-tier, Chinese included)
+through [`llama-swap`](https://github.com/mostlygeek/llama-swap) as a systemd
+service:
+
+```yaml
+# /srv/llama-swap/config.yaml (excerpt)
+models:
+  qwen3-embedding-4b:
+    cmd: |
+      llama-server --model /srv/models/qwen3-embedding-4b/Qwen3-Embedding-4B-Q5_K_M.gguf
+        --embeddings --pooling mean --ctx-size 16384 --batch-size 16384 --ubatch-size 16384
+        --n-gpu-layers 99 --port ${PORT}
+    ttl: 600          # idle 10 min → this model unloads, independently
+  qwen3-reranker-4b:
+    cmd: |
+      llama-server --model /srv/models/qwen3-reranker-4b/Qwen3-Reranker-4B-Q5_K_M.gguf
+        --reranking --ctx-size 32768 --batch-size 16384 --ubatch-size 16384
+        --n-gpu-layers 99 --port ${PORT}
+    ttl: 600
+    reranker: true
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        "rag-models":
+          swap: false      # embedding + reranker stay loaded together
+          exclusive: false
+          members: [qwen3-embedding-4b, qwen3-reranker-4b]
+```
+
+**Rotation semantics**: each model unloads after its own `ttl` of inactivity —
+independent of the other. The `swap: false` group only stops llama-swap's
+*default* behavior of evicting one model to load another (which cost a
+~2.3 s reload per lookup); it does not disable the per-model idle unload.
+The env vars go in `~/.profile` (sourced by `~/.zshrc`):
+
+```bash
+export RAG_EMBED_URL=http://127.0.0.1:18080
+# optionally override the server-side model names:
+# export RAG_EMBED_MODEL=qwen3-embedding-4b
+# export RAG_RERANK_MODEL=qwen3-reranker-4b
+```
+
+**Measured performance** (Qwen3-Embedding-4B Q5_K_M, Ryzen AI MAX+ 395):
+
+| | tokens/s |
+|---|---|
+| GPU (Vulkan iGPU) | ~2420 |
+| CPU (32 threads) | ~726 |
+
+RAG auto-injection lookup runs **without** the reranker (`{ rerank: false }`)
+— hybrid BM25+vector already surfaces the relevant chunks, so an injection
+lookup is ~60 ms hot. `/rag search` and `rag_query` keep the reranker for
+answer quality (the cross-encoder costs ~0.65 s per candidate on the local
+GPU, so it is only worth it for interactive search, not per-turn injection).
 
 ## Install
 
@@ -136,9 +199,9 @@ pi                    # then start the session
 ## How It Works
 
 1. **Index (markdown only)** — `chunkForFile` picks the chunker: markdown files get parent-child chunking (parent = heading section, child = semantic block), everything else falls back to flat line chunks (only reachable via `extraExtensions`). Children are embedded (`bge-m3`, mean-pooled, L2-normalized, sequence length clamped) and stored in SQLite; parents are stored whole for recall.
-2. **Search** — FTS5 `bm25()` with `trigram` tokenization (CJK-aware) + `sqlite-vec` cosine NN, blended `alpha × BM25 + (1-alpha) × cosine`. Hits are children; each hit recalls its **parent section**. With the reranker enabled, the top `RAG_RERANK_TOP_K` candidates are re-scored as (query, parent) cross-encoder pairs and re-sorted.
+2. **Search** — FTS5 `bm25()` with `trigram` tokenization (CJK-aware) + `sqlite-vec` cosine NN, blended `alpha × BM25 + (1-alpha) × cosine`. Hits are children; each hit recalls its **parent section**. With the reranker enabled (default for `/rag search` / `rag_query`), the top `RAG_RERANK_TOP_K` candidates are re-scored as (query, parent) cross-encoder pairs and re-sorted; low-latency callers (RAG auto-injection) pass `{ rerank: false }`.
 3. **md-sync** — for every non-md document, `scanMarkdownSync` checks whether `A/B/B.md` (or legacy `A/B_ocr/B.md`) exists and whether the recorded sha256 sidecar matches the live source; reports `up_to_date` / `needs_convert` / `checksum_missing`.
-4. **Auto-inject** — before every agent turn, the prompt is searched and relevant **parent sections** are appended as a hidden `customType: "rag"` message (KV-cache friendly).
+4. **Auto-inject** — before every agent turn, the prompt is searched (without reranking) and relevant **parent sections** are appended as a hidden `customType: "rag"` message (KV-cache friendly). The message also instructs the model to answer from the retrieved context when it is sufficient, so it does not redundantly re-read the repository files. Any lookup failure is swallowed — RAG never blocks the conversation.
 5. **Auto-refresh** — index older than 24 h re-walks tracked paths and re-indexes changed files in the background (throttled to one check/hour).
 
 ## Storage
@@ -164,7 +227,7 @@ Config lives in `<ragDir>/config.json`:
 
 ```bash
 npm run typecheck
-npx vitest run                      # 128 tests (embeddings suite runs real bge-m3)
+npx vitest run                      # 160 tests (embeddings suite runs real bge-m3)
 SKIP_EMBEDDING_TESTS=1 npx vitest run
 ```
 

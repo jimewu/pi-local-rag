@@ -17,10 +17,69 @@
 - **Markdown 的 parent-child chunking** — parent = 一個 heading 章節（≤200 行），child = 段落/列表/表格/程式碼區塊；命中 child 時召回**整個章節**，避免斷章取義
 - **只索引 markdown** — extension 不直接處理 docx/pdf/xlsx/csv；改為回報轉檔狀態（見下方 md-sync）
 - **md-sync 掃描器** — `A/B.docx` → `A/B/B.md` + `A/B/B.docx.sha256`；相容舊版 `<stem>_ocr/<stem>.md` 配置；標記 `no_markdown` / `checksum_changed` / `checksum_missing`，並以 realpath 收斂 symlink 重複
-- **專案級儲存** — 從 cwd 向上尋找 `.pi/rag/`；退回 `~/.pi/rag/` 全域儲存
+- **專案級儲存** — 從 cwd 向上尋找 `.pi/rag/`；退回 `~/.pi/rag/` 全域儲存。索引/自動補齊時的 store 建立一律**錨定在 repo 根**——刪除 `.pi/rag/` 後會在 repo 內重建，絕不靜默寫入全域 store
 - **自動重新整理** — 索引超過 24 小時會在下次 agent turn 前靜默重新整理；`/rag refresh` 可手動增量更新
-- **自動注入** — 每次 agent turn 前將相關的 **parent 章節**附加在使用者提示後（對 KV-cache 友善）
-- **4 個 AI 工具** — `rag_index`、`rag_query`、`rag_status`、`rag_md_sync`
+- **自動注入** — 每次 agent turn 前將相關的 **parent 章節**附加在使用者提示後（對 KV-cache 友善），並附提示：若檢索到的資訊足以回答，直接據此回答，不必重複翻閱 repo 檔案
+- **GPU 推理 backend（選用）** — 可透過 `RAG_EMBED_URL` / `RAG_RERANK_URL` 將 embedding + reranking 導向本機 [`llama-swap`](https://github.com/mostlygeek/llama-swap) server（Qwen3 GGUF 跑在 AMD iGPU，Vulkan，吞吐約 CPU 的 3.3 倍）；兩模型**並存**且各自**獨立輪轉**（各自 idle `ttl` 後卸載，等同 ollama keep_alive 語意）
+- **Matryoshka（MRL）截斷** — HTTP backend 輸出截斷到 `RAG_EMBEDDING_DIM` 並重新正規化；Qwen3-Embedding-4B 在 1024 維時仍保留 ≥97% 檢索品質（對比完整 2560 維）
+- **4 個 AI 工具** — `rag_index`、`rag_query`、`rag_status`、`rag_md_sync`（另有 `rag_coverage`）
+
+## GPU 推理 backend（llama-swap）
+
+embedding 與 reranking 可跑在本機 GPU 而非 CPU ONNX 管線。參考部署以
+[`llama-swap`](https://github.com/mostlygeek/llama-swap) 作 systemd service，
+服務 **Qwen3-Embedding-4B** 與 **Qwen3-Reranker-4B**（GGUF，MTEB 多語頂尖、含中文）：
+
+```yaml
+# /srv/llama-swap/config.yaml（節錄）
+models:
+  qwen3-embedding-4b:
+    cmd: |
+      llama-server --model /srv/models/qwen3-embedding-4b/Qwen3-Embedding-4B-Q5_K_M.gguf
+        --embeddings --pooling mean --ctx-size 16384 --batch-size 16384 --ubatch-size 16384
+        --n-gpu-layers 99 --port ${PORT}
+    ttl: 600          # idle 10 分鐘 → 此模型卸載，與另一模型無關
+  qwen3-reranker-4b:
+    cmd: |
+      llama-server --model /srv/models/qwen3-reranker-4b/Qwen3-Reranker-4B-Q5_K_M.gguf
+        --reranking --ctx-size 32768 --batch-size 16384 --ubatch-size 16384
+        --n-gpu-layers 99 --port ${PORT}
+    ttl: 600
+    reranker: true
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        "rag-models":
+          swap: false      # embedding + reranker 同時駐留
+          exclusive: false
+          members: [qwen3-embedding-4b, qwen3-reranker-4b]
+```
+
+**輪轉語意**：每個模型在自身 `ttl` 秒未使用後獨立卸載——與另一模型無關。
+`swap: false` 只是關掉 llama-swap **預設**的「載入一模型時卸載另一模型」行為
+（每次查詢多付出 ~2.3 秒重載成本）；並不會停用各模型的 idle 卸載。
+環境變數寫在 `~/.profile`（`~/.zshrc` 會 source）：
+
+```bash
+export RAG_EMBED_URL=http://127.0.0.1:18080
+# 需要時可覆寫 server 端模型名：
+# export RAG_EMBED_MODEL=qwen3-embedding-4b
+# export RAG_RERANK_MODEL=qwen3-reranker-4b
+```
+
+**實測效能**（Qwen3-Embedding-4B Q5_K_M，Ryzen AI MAX+ 395）：
+
+| | tokens/s |
+|---|---|
+| GPU（Vulkan iGPU） | ~2420 |
+| CPU（32 執行緒） | ~726 |
+
+RAG 自動注入的查詢**不跑 reranker**（`{ rerank: false }`）——混合 BM25+vector
+已能找出相關 chunk，注入查詢熱啟動約 **60 ms**。`/rag search` 與 `rag_query`
+保留 reranker 維持回答品質（cross-encoder 在本機 GPU 約每個候選 0.65 秒，
+只適合互動搜尋，不適合每回合注入）。
 
 ## 安裝
 
@@ -132,9 +191,9 @@ pi                    # 然後啟動 session 開始對話
 ## 運作原理
 
 1. **索引（僅 markdown）** — `chunkForFile` 依檔案類型選擇 chunker：markdown 走 parent-child（parent = heading 章節、child = 語意區塊），其他格式退回純行數 chunk（僅可經由 `extraExtensions` 觸及）。child 被 embedding（`bge-m3`、mean pooling、L2 正規化、序列長度受限）並存入 SQLite；parent 完整存放供召回。
-2. **檢索** — FTS5 `bm25()`（`trigram` 分詞，CJK 感知）+ `sqlite-vec` 餘弦最近鄰，以 `alpha × BM25 + (1-alpha) × cosine` 混合。命中對象是 child；每個命中召回其 **parent 章節**。啟用 reranker 時，前 `RAG_RERANK_TOP_K` 個候選以 (query, parent) cross-encoder 配對重新計分排序。
+2. **檢索** — FTS5 `bm25()`（`trigram` 分詞，CJK 感知）+ `sqlite-vec` 餘弦最近鄰，以 `alpha × BM25 + (1-alpha) × cosine` 混合。命中對象是 child；每個命中召回其 **parent 章節**。啟用 reranker 時（`/rag search` / `rag_query` 預設），前 `RAG_RERANK_TOP_K` 個候選以 (query, parent) cross-encoder 配對重新計分排序；低延遲呼叫端（RAG 自動注入）傳 `{ rerank: false }` 跳過。
 3. **md-sync** — 對每個非 md 文件，`scanMarkdownSync` 檢查 `A/B/B.md`（或舊版 `A/B_ocr/B.md`）是否存在，以及記錄的 sha256 sidecar 是否與目前來源相符；回報 `up_to_date` / `needs_convert` / `checksum_missing`。
-4. **自動注入** — 每次 agent turn 前以提示詞檢索，將相關 **parent 章節**作為隱藏 `customType: "rag"` 訊息附加（KV-cache 友善）。
+4. **自動注入** — 每次 agent turn 前以提示詞檢索（不跑 reranker），將相關 **parent 章節**作為隱藏 `customType: "rag"` 訊息附加（KV-cache 友善）。訊息同時指示模型：若檢索到的資訊足以回答，直接據此回答，不要重複翻閱 repo 檔案。任何查詢失敗都會被吞掉——RAG 絕不阻塞對話。
 5. **自動重新整理** — 索引超過 24 小時時，背景重新走訪 tracked paths 並重新索引變更檔案（每小時至多一次檢查）。
 
 ## 儲存
@@ -160,7 +219,7 @@ pi                    # 然後啟動 session 開始對話
 
 ```bash
 npm run typecheck
-npx vitest run                      # 128 個測試（embedding 套件跑真實 bge-m3）
+npx vitest run                      # 160 個測試（embedding 套件跑真實 bge-m3）
 SKIP_EMBEDDING_TESTS=1 npx vitest run
 ```
 

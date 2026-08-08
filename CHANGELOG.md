@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.3
+
+- **`bin/rag` CLI** — run without installing the extension: `cd <repo> && /path/to/pi-local-rag/bin/rag status|coverage|auto|mdsync|help` (Node ≥ 23.6 native TS). `--dir`/`--json` supported; `auto` streams live progress to stderr.
+- **HTTP embedding/rerank backend** — `RAG_EMBED_URL`/`RAG_RERANK_URL` (e.g. llama-swap) route inference off the CPU; output is MRL-truncated to `RAG_EMBEDDING_DIM` and re-normalized; requests are batched by a char budget and over-long inputs truncated so a single chunk never exceeds the server's ctx/batch. `RAG_EMBED_MODEL`/`RAG_RERANK_MODEL` name the server-side models. No machine-specific info is baked into the repo (URLs come from env).
+- **GPU backend deployment (reference)** — [`llama-swap`](https://github.com/mostlygeek/llama-swap) systemd service serving Qwen3-Embedding-4B + Qwen3-Reranker-4B GGUF on the AMD iGPU (Vulkan, ~2420 vs ~726 tokens/s CPU). A `swap: false` group keeps both resident while each **rotates independently** via its own idle `ttl` (ollama keep_alive semantics).
+- **Latency: RAG auto-inject 12.6 s → 60 ms** — the injection lookup passes `{ rerank: false }` (hybrid BM25+vector already surfaces relevant chunks); `/rag search`/`rag_query` keep the cross-encoder for answer quality.
+- **Store anchoring** — index/auto-complete always creates `.pi/rag/` under the repo root (never the global `~/.pi/rag/` fallback, never cwd when `--dir` differs); `/rag rebuild|refresh` anchor too.
+- **`before_agent_start` hardening** — any RAG lookup/refresh error is swallowed (logged to stderr) so a failed lookup can never block the agent turn; the injected message now instructs the model to answer from the retrieved context when sufficient (no redundant repo re-reading).
+- **Coverage robustness** — md-vs-index comparison matches by realpath (symlinked aliases) and by relative path from each side's lowest common directory (repo relocation no longer flips to 0%); rendering moved to a transcript entry (`appendEntry` + `registerEntryRenderer`).
+- **Crash-safe indexing** — old chunks/vectors are deleted inside the Phase 3 transaction, so an embedding failure leaves the previous index intact (previously a failure wiped all chunks while files rows remained).
+- **Embedding metadata** — `status`/DB record the real embedder (`activeEmbeddingModel()`: server-side model when HTTP, else local ONNX).
+- **Testing**: 160 tests (159 passed + 1 skipped), incl. HTTP backend batching/MRL/rerank-alignment, embed-failure data safety, store anchoring, and command-handler behavior.
+
 ## 0.5.2
 
 - **`/rag coverage --auto`** (and `rag_coverage(auto: true)`): when the report is not complete, auto-fixes gaps in priority order — write missing checksums (trusts existing md), convert documents via anydoc (OCR CLI fallback for scanned PDFs when `RAG_OCR_CLI`/`RAG_OCR_API` are set), then re-index everything (hash-skip makes the full walk cheap). `convertOneDocument` never throws; command runner injectable for tests. Verified live: 3 docs (xlsx/pdf/csv) converted + checksummed, verdict went `needs_convert → complete`.
