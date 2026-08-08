@@ -205,21 +205,43 @@ export function isRerankerEnabled(): boolean {
 }
 
 async function rerankHttp(query: string, passages: string[]): Promise<number[]> {
-  const resp = await fetch(`${RERANK_URL}/v1/rerank`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: RERANK_HTTP_MODEL, query, documents: passages }),
-  });
-  if (!resp.ok) {
-    throw new Error(`RAG_RERANK_URL ${RERANK_URL} returned ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-  }
-  const data = (await resp.json()) as { results?: Array<{ index: number; relevance_score: number }> };
+  // Rerank feeds the query + ALL candidate passages to the model in one go,
+  // bounded by the server's ctx/batch — long parents can blow past it. Split
+  // into batches under the same char budget used for embeddings, and truncate
+  // over-long passages, so a rerank never exceeds the server limit.
   const scores = new Array<number>(passages.length).fill(0);
-  for (const r of data.results ?? []) {
-    if (Number.isInteger(r.index) && r.index >= 0 && r.index < scores.length) {
-      scores[r.index] = Math.min(1, Math.max(0, r.relevance_score));
+  let batch: string[] = [];
+  let batchChars = 0;
+
+  const flush = async (offset: number) => {
+    if (batch.length === 0) return;
+    const resp = await fetch(`${RERANK_URL}/v1/rerank`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: RERANK_HTTP_MODEL, query, documents: batch }),
+    });
+    if (!resp.ok) {
+      throw new Error(`RAG_RERANK_URL ${RERANK_URL} returned ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
     }
+    const data = (await resp.json()) as { results?: Array<{ index: number; relevance_score: number }> };
+    for (const r of data.results ?? []) {
+      if (Number.isInteger(r.index) && r.index >= 0 && r.index < batch.length) {
+        scores[offset + r.index] = Math.min(1, Math.max(0, r.relevance_score));
+      }
+    }
+    batch = [];
+    batchChars = 0;
+  };
+
+  for (let i = 0; i < passages.length; i++) {
+    const clipped = passages[i]!.length > HTTP_MAX_CHARS ? passages[i]!.slice(0, HTTP_MAX_CHARS) : passages[i]!;
+    if (batch.length > 0 && batchChars + clipped.length > HTTP_BATCH_MAX_CHARS) {
+      await flush(i - batch.length);
+    }
+    batch.push(clipped);
+    batchChars += clipped.length;
   }
+  await flush(passages.length - batch.length);
   return scores;
 }
 

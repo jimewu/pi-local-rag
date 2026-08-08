@@ -184,8 +184,11 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    const database = getDbConn();
+    // RAG auto-injection is an enhancement — a lookup/embedding failure must
+    // NEVER block the agent turn (that manifests as the conversation showing
+    // nothing). Any error here is logged to stderr and swallowed.
     try {
+      const database = getDbConn();
       const stats = getIndexStats(database);
       if (stats.totalChunks === 0) return;
 
@@ -238,6 +241,9 @@ export default function (pi: ExtensionAPI) {
           display: false,
         },
       };
+    } catch (e) {
+      process.stderr.write(`[rag] auto-inject skipped: ${(e as Error).message}\n`);
+      return;
     } finally {
       // getDbConn is a process-wide singleton — do not close it here.
     }

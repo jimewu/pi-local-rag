@@ -88,6 +88,18 @@ describe("HTTP embedding/rerank backend (RAG_EMBED_URL / RAG_RERANK_URL)", () =>
     expect(rerankRequests[0]!.query).toBe("臨床評估");
   });
 
+  it("splits large rerank loads across requests and aligns scores", async () => {
+    const before = rerankRequests.length;
+    const { rerank } = await import("../embed.ts");
+    // 10 long passages ≈ 10 × 3000 chars — must split into ≥2 requests.
+    const passages = Array.from({ length: 10 }, (_, i) => "臨床評估報告內容片段".repeat(250) + ` ${i}`);
+    const scores = (await rerank("量測裝置臨床評估", passages))!;
+    expect(scores.length).toBe(10);
+    expect(rerankRequests.length - before).toBeGreaterThanOrEqual(2);
+    // All scores filled (each request returned scores for its own batch).
+    expect(scores.every(s => s > 0)).toBe(true);
+  });
+
   it("isRerankerEnabled is true when RAG_RERANK_URL is set", async () => {
     const { isRerankerEnabled } = await import("../embed.ts");
     expect(isRerankerEnabled()).toBe(true);
