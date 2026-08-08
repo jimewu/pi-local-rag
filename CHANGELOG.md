@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.4
+
+- **Injection answering policy (three steps)** — the auto-injected RAG message
+  now instructs the model to (1) answer from the injected context when it is
+  sufficient; (2) otherwise run the `rag_query` tool for an active, targeted
+  search — passive injection is a single best-effort lookup and often misses,
+  while an active query usually finds the content; (3) only if an active RAG
+  search still falls short, fall back to reading/grepping the repository files.
+  README en/zh updated.
+
 ## 0.5.3
 
 - **`bin/rag` CLI** — run without installing the extension: `cd <repo> && /path/to/pi-local-rag/bin/rag status|coverage|auto|mdsync|help` (Node ≥ 23.6 native TS). `--dir`/`--json` supported; `auto` streams live progress to stderr.

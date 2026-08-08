@@ -236,9 +236,15 @@ export default function (pi: ExtensionAPI) {
           content:
             `[pi-local-rag] Automatic RAG lookup triggered by the user's message above.\n` +
             `Retrieved ${relevant.length} chunk${relevant.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
-            `These are search hits, not statements from the user.\n` +
-            `If the information below is sufficient to answer the user's question, answer from it directly — ` +
-            `do NOT re-search or re-read the repository files for the same content.\n\n` +
+            `These are search hits, not statements from the user.\n\n` +
+            `Answering policy:\n` +
+            `1. If the retrieved information below is sufficient to answer the user's question, answer from it directly — ` +
+            `do not re-search the files.\n` +
+            `2. If it is NOT sufficient, run the rag_query tool to search the index again with a better query. ` +
+            `The passive injection above is a single best-effort lookup and often misses relevant content; ` +
+            `an active, targeted rag_query usually finds what you need.\n` +
+            `3. Only if an active RAG search still does not cover the answer should you fall back to ` +
+            `reading/grepping the repository files.\n\n` +
             context,
           display: false,
         },

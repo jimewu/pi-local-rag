@@ -1409,6 +1409,19 @@ describe("before_agent_start: 24h auto-refresh", () => {
     expect(readLastBuild()).toBe(freshBuild);
   });
 
+  it("injected message carries the three-step answering policy (answer → rag_query → read/grep)", async () => {
+    seedIndex({ filePath: "/some/file.ts", lastBuild: new Date().toISOString() });
+    const { pi, fire } = makePi();
+    extensionFactory(pi as any);
+    const result = await fire({ prompt: "hello world", systemPrompt: "" }) as { message?: { content?: string } };
+    expect(result?.message?.content).toBeDefined();
+    expect(result!.message!.content).toContain("Answering policy");
+    // Step 2: instruct the agent to use the active RAG tool before file browsing.
+    expect(result!.message!.content).toContain("rag_query");
+    // Step 3: fall back to reading/grepping only as a last resort.
+    expect(result!.message!.content).toContain("reading/grepping");
+  });
+
   it("updates last_build when index is stale and files exist on disk", async () => {
     const testFile = join(cwdSandbox, "sample.ts");
     writeFileSync(testFile, "export const answer = 42;\n");

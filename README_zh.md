@@ -19,7 +19,7 @@
 - **md-sync 掃描器** — `A/B.docx` → `A/B/B.md` + `A/B/B.docx.sha256`；相容舊版 `<stem>_ocr/<stem>.md` 配置；標記 `no_markdown` / `checksum_changed` / `checksum_missing`，並以 realpath 收斂 symlink 重複
 - **專案級儲存** — 從 cwd 向上尋找 `.pi/rag/`；退回 `~/.pi/rag/` 全域儲存。索引/自動補齊時的 store 建立一律**錨定在 repo 根**——刪除 `.pi/rag/` 後會在 repo 內重建，絕不靜默寫入全域 store
 - **自動重新整理** — 索引超過 24 小時會在下次 agent turn 前靜默重新整理；`/rag refresh` 可手動增量更新
-- **自動注入** — 每次 agent turn 前將相關的 **parent 章節**附加在使用者提示後（對 KV-cache 友善），並附提示：若檢索到的資訊足以回答，直接據此回答，不必重複翻閱 repo 檔案
+- **自動注入** — 每次 agent turn 前將相關的 **parent 章節**附加在使用者提示後（對 KV-cache 友善），並附**三步回答策略**：(1) 注入內容足夠時直接回答；(2) 不足時先跑 `rag_query` 工具主動、針對性地搜尋索引；(3) 主動 RAG 仍不足，才退回用 read/grep 翻看 repo 檔案
 - **GPU 推理 backend（選用）** — 可透過 `RAG_EMBED_URL` / `RAG_RERANK_URL` 將 embedding + reranking 導向本機 [`llama-swap`](https://github.com/mostlygeek/llama-swap) server（Qwen3 GGUF 跑在 AMD iGPU，Vulkan，吞吐約 CPU 的 3.3 倍）；兩模型**並存**且各自**獨立輪轉**（各自 idle `ttl` 後卸載，等同 ollama keep_alive 語意）
 - **Matryoshka（MRL）截斷** — HTTP backend 輸出截斷到 `RAG_EMBEDDING_DIM` 並重新正規化；Qwen3-Embedding-4B 在 1024 維時仍保留 ≥97% 檢索品質（對比完整 2560 維）
 - **4 個 AI 工具** — `rag_index`、`rag_query`、`rag_status`、`rag_md_sync`（另有 `rag_coverage`）
@@ -193,7 +193,7 @@ pi                    # 然後啟動 session 開始對話
 1. **索引（僅 markdown）** — `chunkForFile` 依檔案類型選擇 chunker：markdown 走 parent-child（parent = heading 章節、child = 語意區塊），其他格式退回純行數 chunk（僅可經由 `extraExtensions` 觸及）。child 被 embedding（`bge-m3`、mean pooling、L2 正規化、序列長度受限）並存入 SQLite；parent 完整存放供召回。
 2. **檢索** — FTS5 `bm25()`（`trigram` 分詞，CJK 感知）+ `sqlite-vec` 餘弦最近鄰，以 `alpha × BM25 + (1-alpha) × cosine` 混合。命中對象是 child；每個命中召回其 **parent 章節**。啟用 reranker 時（`/rag search` / `rag_query` 預設），前 `RAG_RERANK_TOP_K` 個候選以 (query, parent) cross-encoder 配對重新計分排序；低延遲呼叫端（RAG 自動注入）傳 `{ rerank: false }` 跳過。
 3. **md-sync** — 對每個非 md 文件，`scanMarkdownSync` 檢查 `A/B/B.md`（或舊版 `A/B_ocr/B.md`）是否存在，以及記錄的 sha256 sidecar 是否與目前來源相符；回報 `up_to_date` / `needs_convert` / `checksum_missing`。
-4. **自動注入** — 每次 agent turn 前以提示詞檢索（不跑 reranker），將相關 **parent 章節**作為隱藏 `customType: "rag"` 訊息附加（KV-cache 友善）。訊息同時指示模型：若檢索到的資訊足以回答，直接據此回答，不要重複翻閱 repo 檔案。任何查詢失敗都會被吞掉——RAG 絕不阻塞對話。
+4. **自動注入** — 每次 agent turn 前以提示詞檢索（不跑 reranker），將相關 **parent 章節**作為隱藏 `customType: "rag"` 訊息附加（KV-cache 友善）。訊息附**三步回答策略**：注入內容足夠時直接回答；不足時先跑 `rag_query` 工具主動搜尋（被動注入只是單次 best-effort 查詢，常漏掉相關內容——主動搜尋通常找得到）；主動 RAG 仍不足才退回 read/grep 翻看 repo 檔案。任何查詢失敗都會被吞掉——RAG 絕不阻塞對話。
 5. **自動重新整理** — 索引超過 24 小時時，背景重新走訪 tracked paths 並重新索引變更檔案（每小時至多一次檢查）。
 
 ## 儲存
