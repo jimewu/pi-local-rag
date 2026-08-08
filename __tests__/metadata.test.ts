@@ -6,7 +6,7 @@
  * of that file via BM25 — a cheap cross-file link without a graph DB.
  */
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -89,7 +89,8 @@ describe("metadata seed (rag-metadata.json)", () => {
   it("loadMetadataSeed reads JSON and resolves relative paths against root", () => {
     const root = mkdtempSync(join(tmpdir(), "rag-seed-"));
     try {
-      writeFileSync(join(root, "rag-metadata.json"), JSON.stringify({
+      mkdirSync(join(root, ".pi"), { recursive: true });
+      writeFileSync(join(root, ".pi", "rag-metadata.json"), JSON.stringify({
         "docs/a.md": "PROD-A series clinical evaluation report",
         "docs/b.md": "  ", // blank tags are skipped
       }));
@@ -105,9 +106,10 @@ describe("metadata seed (rag-metadata.json)", () => {
     const db = makeDb();
     const root = mkdtempSync(join(tmpdir(), "rag-seed2-"));
     try {
+      mkdirSync(join(root, ".pi"), { recursive: true });
       seedFile(db, join(root, "docs/a.md"), "內容段落", null);
       seedFile(db, join(root, "docs/b.md"), "內容段落", "既有標籤");
-      writeFileSync(join(root, "rag-metadata.json"), JSON.stringify({
+      writeFileSync(join(root, ".pi", "rag-metadata.json"), JSON.stringify({
         "docs/a.md": "PROD-A series evaluation",
         "docs/c.md": "未索引的檔案",
       }));

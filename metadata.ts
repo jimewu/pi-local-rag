@@ -1,8 +1,9 @@
 /**
  * File metadata seed — a single source of truth for per-file entity tags.
  *
- * The seed lives at `<repo>/rag-metadata.json` (next to the case repo so it
- * is version-controlled and travels with the repo):
+ * The seed lives at `<repo>/.pi/rag-metadata.json` — inside the pi project
+ * config dir, next to the store, so it is not mixed into the repo's own
+ * file listing and still travels with the case repo when it moves:
  *
  *   {
  *     "docs/product-evaluation.md": "PROD-A series clinical evaluation report",
@@ -24,7 +25,9 @@ import { setFileMetadata, listFilePaths } from "./repository.ts";
 export const METADATA_SEED_FILE = "rag-metadata.json";
 
 export function metadataSeedPath(root: string): string {
-  return join(root, METADATA_SEED_FILE);
+  // Inside .pi/ (the project config dir, sibling of .pi/rag/) — not the repo
+  // root — so the seed stays out of the knowledge base's own files.
+  return join(root, ".pi", METADATA_SEED_FILE);
 }
 
 /** Load the seed map, resolving every key against `root`. */

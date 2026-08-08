@@ -140,7 +140,8 @@ work with zero graph infrastructure. Re-indexing keeps existing tags (the
 ### Metadata seed (`rag-metadata.json`)
 
 For maintenance (and so tags survive a rebuild), keep the tags in a seed file
-at the repo root — version-controlled and travels with the case repo:
+at `<repo>/.pi/rag-metadata.json` — inside the pi project config dir, so it
+travels with the case repo and stays out of the knowledge base's own files:
 
 ```json
 {
@@ -149,7 +150,7 @@ at the repo root — version-controlled and travels with the case repo:
 }
 ```
 
-Keys are paths **relative to the repo root** (stable across relocations); paths
+Keys are paths **relative to the repo root** (stable across relocations); the file lives in `.pi/`; paths
 must match the indexed files exactly (including directory levels). Every
 `/rag index` / `rebuild` / `refresh` / `auto` run re-applies the seed
 automatically (`indexFiles` applies it on completion), and `/rag meta seed`
