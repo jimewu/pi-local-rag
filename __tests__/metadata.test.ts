@@ -126,3 +126,25 @@ describe("metadata seed (rag-metadata.json)", () => {
     }
   });
 });
+
+describe("extractTags (LLM tag parsing)", () => {
+  it("strips field labels, numbering, and joins lines into comma-separated tags", async () => {
+    const { extractTags } = await import("../metadata.ts");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => ({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "產品/型號: MT-850\n文件類型: CER\n臨床評估, 溫度計" } }],
+      }),
+    })) as unknown as typeof fetch;
+    try {
+      const tags = await extractTags("docs/a.md", "內容", { llmUrl: "http://x", model: "m" });
+      expect(tags).toContain("MT-850");
+      expect(tags).toContain("CER");
+      expect(tags).toContain("臨床評估");
+      expect(tags).not.toContain("產品/型號");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

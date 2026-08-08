@@ -128,7 +128,8 @@ stored in the FTS index (schema v3, `files.metadata` + `chunks_fts.metadata`):
 /rag meta list          # all tagged files
 /rag meta <path>        # show one file's tags
 /rag meta -d <path>     # clear
-/rag meta seed          # apply the seed file (rag-metadata.json) to the index
+/rag meta seed          # apply the seed file (.pi/rag-metadata.json) to the index
+/rag meta generate      # generate tags for ALL indexed files via a local LLM (see below)
 ```
 
 How it works (方式 3): the tags become an FTS column, so a query hitting a tag
@@ -136,6 +137,19 @@ How it works (方式 3): the tags become an FTS column, so a query hitting a tag
 every chunk of that file via BM25, and `hybridSearch` boosts the tagged files' chunks. This makes cross-file lookups like “everything about product PROD-A”
 work with zero graph infrastructure. Re-indexing keeps existing tags (the
 `ON CONFLICT` upsert never overwrites `metadata`).
+
+### Batch generation with a local LLM
+
+`/rag meta generate` (or `bin/rag meta generate`) tags **every indexed file**
+through a small local chat model (default `qwen2.5-3b-tag` served by the same
+llama-swap instance; no frontier model needed). It reads each file name + leading
+content, classifies the document type and extracts product model + topic keywords
+into `.pi/rag-metadata.json`, then applies. Env:
+
+```bash
+export RAG_META_URL=http://127.0.0.1:18080      # OpenAI-compatible chat server (default: falls back to RAG_EMBED_URL)
+export RAG_META_MODEL=qwen2.5-3b-tag            # model name on that server (optional)
+```
 
 ### Metadata seed (`rag-metadata.json`)
 

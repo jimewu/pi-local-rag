@@ -50,7 +50,7 @@ import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
 import { getDbConn, loadIndex, saveIndex, getIndexStats } from "./db.ts";
 import * as repo from "./repository.ts";
-import { applyMetadataSeed, metadataSeedPath } from "./metadata.ts";
+import { applyMetadataSeed, metadataSeedPath, generateMetadataSeed } from "./metadata.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { scanMarkdownSync } from "./md-sync.ts";
 import { computeCoverage, coverageVerdictLabel } from "./coverage.ts";
@@ -415,6 +415,28 @@ export default function (pi: ExtensionAPI) {
         if (metaArgs[0] === "seed") {
           const applied = applyMetadataSeed(database, process.cwd());
           ctx.ui.notify(`Metadata seed applied to ${applied} file(s) (${metadataSeedPath(process.cwd())})`, "info");
+          return;
+        }
+
+        if (metaArgs[0] === "generate") {
+          const llmUrl = process.env.RAG_META_URL ?? process.env.RAG_EMBED_URL;
+          if (!llmUrl) {
+            ctx.ui.notify("RAG_META_URL (or RAG_EMBED_URL) required — e.g. http://127.0.0.1:18080", "error");
+            return;
+          }
+          const model = process.env.RAG_META_MODEL ?? "qwen2.5-3b-tag";
+          ctx.ui.notify(`⏳ Generating metadata tags via ${model}…`, "info");
+          let last = 0;
+          const result = await generateMetadataSeed(database, process.cwd(), { llmUrl, model }, (done, total) => {
+            if (done - last >= 5 || done === total) {
+              last = done;
+              ctx.ui.setStatus("rag", `■ meta generate ${done}/${total}`);
+            }
+          });
+          ctx.ui.setStatus("rag", undefined);
+          ctx.ui.notify(`✅ Generated/updated tags for ${result.generated} file(s)` +
+            (result.failed.length ? ` · ${result.failed.length} failed (see terminal)` : ""), "info");
+          for (const f of result.failed.slice(0, 5)) process.stderr.write(`[rag] meta generate ✗ ${f.path}: ${f.reason}\n`);
           return;
         }
 

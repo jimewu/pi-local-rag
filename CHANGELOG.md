@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.7
+
+- **`meta generate` (CLI + `/rag meta generate`)** — batch-tag every indexed
+  file through a small local chat model (Qwen2.5-3B-Instruct via llama-swap's
+  `/v1/chat/completions`; no frontier model needed). Classification-style
+  prompt constrains output to `type, model, keywords…` which small models
+  follow reliably; tags land in `.pi/rag-metadata.json` and are applied.
+  `RAG_META_URL` / `RAG_META_MODEL` env override server + model. Verified on a
+  158-file repo: tags generated in minutes, metadata hits rank tagged files
+  first (e.g. querying 審查意見 surfaces the review documents).
+- Qwen3.5-0.8B (with or without MTP) produces empty generation on the
+  bundled llama.cpp (b10301) — architecture incompatibility; Qwen2.5-3B is
+  used instead.
+
 ## 0.5.6.1 (security)
 
 - **Scrubbed confidential case information from the entire git history**:

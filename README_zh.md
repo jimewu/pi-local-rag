@@ -123,7 +123,8 @@ case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見
 /rag meta list          # 列出所有已標記檔案
 /rag meta <path>        # 顯示單一檔案的標記
 /rag meta -d <path>     # 清除
-/rag meta seed          # 套用種子檔（rag-metadata.json）到索引
+/rag meta seed          # 套用種子檔（.pi/rag-metadata.json）到索引
+/rag meta generate      # 用本地小模型為所有已索引檔案批次生成標記（見下方）
 ```
 
 運作原理（方式 3）：標記成為 FTS 欄位——查詢命中標記（如 `PROD-A`，一個
@@ -131,6 +132,18 @@ case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見
 `hybridSearch` 對被標記檔案的 chunk 提升分數。跨檔案查詢（如「產品 PROD-A
 的全部資料」）因此不需任何圖基礎設施即可達成。重新索引不會覆蓋既有標記
 （`ON CONFLICT` upsert 不動 `metadata`）。
+
+### 本地 LLM 批次生成
+
+`/rag meta generate`（或 `bin/rag meta generate`）會為**每個已索引檔案**
+透過本地小 chat 模型（預設 `qwen2.5-3b-tag`，由同一個 llama-swap 服務；不需頂尖模型）
+生成標記：讀取檔名與開頭內容、分類文件類型、提取產品型號與主題關鍵詞，
+寫入 `.pi/rag-metadata.json` 後套用。環境變數：
+
+```bash
+export RAG_META_URL=http://127.0.0.1:18080      # OpenAI 相容 chat server（預設退回 RAG_EMBED_URL）
+export RAG_META_MODEL=qwen2.5-3b-tag            # 該 server 上的模型名（選用）
+```
 
 ### Metadata 種子檔（`rag-metadata.json`）
 

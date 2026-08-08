@@ -315,6 +315,27 @@ export async function main(argv: string[]): Promise<number> {
           console.log(GREEN + `Metadata seed applied to ${applied} file(s)` + RST + D + ` (${metadataSeedPath(process.cwd())})` + RST);
           return 0;
         }
+        if (metaArgs[0] === "generate") {
+          const { generateMetadataSeed } = await import("./metadata.ts");
+          const llmUrl = process.env.RAG_META_URL ?? process.env.RAG_EMBED_URL;
+          if (!llmUrl) {
+            console.error(RED + "RAG_META_URL (or RAG_EMBED_URL) required — e.g. http://127.0.0.1:18080" + RST);
+            return 1;
+          }
+          const model = process.env.RAG_META_MODEL ?? "qwen2.5-3b-tag";
+          let last = 0;
+          const result = await generateMetadataSeed(db, process.cwd(), { llmUrl, model }, (done, total) => {
+            if (done - last >= 5 || done === total) {
+              last = done;
+              process.stderr.write(`\r\x1b[2K[pi-rag] meta generate ${done}/${total}`);
+            }
+          });
+          process.stderr.write("\r\x1b[2K");
+          console.log(GREEN + `✅ Generated/updated tags for ${result.generated} file(s)` + RST + D + ` (model ${model})` + RST);
+          for (const f of result.failed.slice(0, 5)) console.log("  " + RED + "✗ " + f.path + RST + "  " + D + f.reason + RST);
+          if (result.failed.length > 5) console.log(D + `  … and ${result.failed.length - 5} more` + RST);
+          return 0;
+        }
         if (metaArgs.length === 0 || metaArgs[0] === "list") {
           const rows = (await import("./repository.ts")).listFiles(db).filter(f => f.metadata);
           console.log(B + `📎 File metadata (${rows.length})` + RST);
