@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.5
+
+- **File metadata (entity tags, 方式 3 / FTS column)** — per-file tags
+  (product, doc type, related docs…) become a searchable FTS column:
+  - schema v3: `files.metadata` + `chunks_fts.metadata`; migration rebuilds
+    only the FTS table (vectors untouched, no re-embedding)
+  - queries hitting a tag (e.g. `PROD-A`, a product name absent from file
+    bodies) score every chunk of that file via BM25, and `hybridSearch`
+    boosts tagged files' chunks — cross-file links without a graph database
+  - `/rag meta` (pi) + `bin/rag meta` (CLI): list / set / show / clear tags;
+    re-indexing never overwrites existing tags
+- **BM25 normalization fix** — bm25() returns negative scores where smaller
+  is better, but normalization inverted the ranking (best → 0, worst → 1),
+  hidden until pure-BM25 hits (a metadata-only match) exposed it
+- 4 new tests (schema v3, metadata-only BM25 hit, setFileMetadata
+  propagation, upsert keeps tags); verified on the real case repo:
+  “PROD-A” now surfaces the tagged CER/risk-questionnaire files first
+
 ## 0.5.4
 
 - **Injection answering policy (three steps)** — the auto-injected RAG message

@@ -49,6 +49,7 @@ import { DOC_CONVERT_EXTS } from "./constants.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
 import { getDbConn, loadIndex, saveIndex, getIndexStats } from "./db.ts";
+import * as repo from "./repository.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { scanMarkdownSync } from "./md-sync.ts";
 import { computeCoverage, coverageVerdictLabel } from "./coverage.ts";
@@ -271,6 +272,7 @@ export default function (pi: ExtensionAPI) {
     { value: "on",       label: "on",       description: "Enable auto-injection" },
     { value: "off",      label: "off",      description: "Disable auto-injection" },
     { value: "mdsync",   label: "mdsync",   description: "Scan non-md documents for conversion state (checksum check)" },
+    { value: "meta",      label: "meta",      description: "Set/list per-file entity metadata tags (product, doc type…) — searched via FTS" },
     { value: "coverage", label: "coverage", description: "Completeness report: indexed md vs disk, document conversion, index health" },
     { value: "help",     label: "help",     description: "Show all /rag commands" },
   ];
@@ -400,6 +402,48 @@ export default function (pi: ExtensionAPI) {
         if (docs.length === 0) lines.push(th.fg("dim", "  (no non-md documents found)"));
         lines.push("", th.fg("dim", "Convert via the convert-documents-to-markdown skill (anydoc / batch-ocr)."));
         ctx.ui.setWidget("rag-mdsync", lines);
+        return;
+      }
+
+      // ── meta: per-file entity metadata tags (searched via the FTS column) ──
+      if (cmd === "meta") {
+        const database = getDbConn();
+        const metaArgs = parts.slice(1);
+        const th = ctx.ui.theme;
+
+        const showMeta = (path: string): void => {
+          const f = repo.getFile(database, path);
+          if (!f) { ctx.ui.notify(`Not indexed: ${path}`, "warning"); return; }
+          ctx.ui.notify(f.metadata ? `${path}\n  ${f.metadata}` : `No metadata set: ${path}`, "info");
+        };
+
+        if (metaArgs.length === 0 || metaArgs[0] === "list") {
+          const rows = repo.listFiles(database).filter(f => f.metadata);
+          const lines: string[] = [th.bold(`📎 File metadata (${rows.length})`), ""];
+          for (const r of rows) {
+            const rel = r.path.startsWith(process.cwd()) ? r.path.slice(process.cwd().length + 1) : r.path;
+            lines.push("  " + th.fg("success", rel));
+            lines.push("    " + th.fg("muted", r.metadata ?? ""));
+          }
+          if (!rows.length) lines.push(th.fg("dim", "  (none — set via /rag meta <path> <tags>)"));
+          ctx.ui.setWidget("rag-meta", lines);
+          return;
+        }
+
+        if (metaArgs[0] === "-d" || metaArgs[0] === "--delete") {
+          const path = resolve(metaArgs[1] || ".");
+          if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
+          repo.setFileMetadata(database, path, null);
+          ctx.ui.notify(`Cleared metadata: ${path}`, "info");
+          return;
+        }
+
+        const path = resolve(metaArgs[0]!);
+        if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
+        const text = metaArgs.slice(1).join(" ").trim();
+        if (!text) { showMeta(path); return; }
+        repo.setFileMetadata(database, path, text);
+        ctx.ui.notify(`✅ Metadata set: ${path}\n  ${text}`, "info");
         return;
       }
 

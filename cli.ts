@@ -9,6 +9,7 @@
  *   pi-rag coverage [dir]        → completeness report
  *   pi-rag auto [dir]            → auto-complete (checksums, convert, index)
  *   pi-rag mdsync [dir]          → document conversion state
+ *   pi-rag meta [path] [tags…]    → set/list per-file entity metadata tags
  *
  * Run it from the case repo directory, or pass --dir <path>. Add --json for
  * machine-readable output. Requires Node >= 23.6 (native TypeScript type
@@ -39,6 +40,7 @@ const USAGE = `pi-rag — pi-local-rag 命令列工具
   coverage [dir]        完整性報告（md vs 索引、文件轉檔、索引健康）
   auto [dir]            自動補齊知識庫（補 checksum、轉檔、索引）
   mdsync [dir]          掃描非 md 文件轉檔狀態
+  meta [path] [tags…]   設定/列出每檔案實體 metadata 標記
   help                  顯示說明
 
 選項:
@@ -58,10 +60,12 @@ export interface CliArgs {
   dir?: string;
   json: boolean;
   help: boolean;
+  /** Positional args after the command (e.g. `meta <path> <tags>`). */
+  rest: string[];
 }
 
 export function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { command: "status", json: false, help: false };
+  const args: CliArgs = { command: "status", json: false, help: false, rest: [] };
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -72,7 +76,10 @@ export function parseArgs(argv: string[]): CliArgs {
     else if (a.startsWith("-")) { /* ignore unknown flags */ }
     else positional.push(a);
   }
-  if (positional.length > 0) args.command = positional[0]!;
+  if (positional.length > 0) {
+    args.command = positional[0]!;
+    args.rest = positional.slice(1);
+  }
   if (args.command === "help") args.help = true;
   return args;
 }
@@ -299,6 +306,42 @@ export async function main(argv: string[]): Promise<number> {
       case "mdsync":
         console.log(await formatMdsync(process.cwd(), args));
         return 0;
+      case "meta": {
+        const db = getDbConn();
+        const metaArgs = args.rest ?? [];
+        if (metaArgs.length === 0 || metaArgs[0] === "list") {
+          const rows = (await import("./repository.ts")).listFiles(db).filter(f => f.metadata);
+          console.log(B + `📎 File metadata (${rows.length})` + RST);
+          for (const r of rows) {
+            console.log("  " + GREEN + r.path + RST);
+            console.log("    " + D + r.metadata + RST);
+          }
+          if (!rows.length) console.log(D + "  (none — set via: bin/rag meta <path> <tags>)" + RST);
+          return 0;
+        }
+        const { resolve } = await import("node:path");
+        const { existsSync } = await import("node:fs");
+        const { setFileMetadata, getFile } = await import("./repository.ts");
+        if (metaArgs[0] === "-d" || metaArgs[0] === "--delete") {
+          const p = resolve(metaArgs[1] ?? ".");
+          if (!existsSync(p)) { console.error(RED + `Path not found: ${p}` + RST); return 1; }
+          setFileMetadata(db, p, null);
+          console.log(GREEN + `Cleared metadata: ${p}` + RST);
+          return 0;
+        }
+        const p = resolve(metaArgs[0]!);
+        if (!existsSync(p)) { console.error(RED + `Path not found: ${p}` + RST); return 1; }
+        const text = metaArgs.slice(1).join(" ").trim();
+        if (!text) {
+          const f = getFile(db, p);
+          if (!f) { console.error(RED + `Not indexed: ${p}` + RST); return 1; }
+          console.log(f.metadata ? `${p}\n  ${f.metadata}` : `No metadata set: ${p}`);
+          return 0;
+        }
+        setFileMetadata(db, p, text);
+        console.log(GREEN + `✅ Metadata set: ${p}` + RST + `\n  ${text}`);
+        return 0;
+      }
       default:
         console.error(USAGE);
         return 1;

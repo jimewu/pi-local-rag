@@ -22,6 +22,7 @@ Local hybrid RAG pipeline for the [Pi coding agent](https://github.com/badlogic/
 - **Auto-injection** — relevant parent sections appended after the user prompt before every agent turn (KV-cache friendly), with a three-step answering policy: (1) answer from the injected context when sufficient; (2) otherwise run the `rag_query` tool for an active, targeted search; (3) only then fall back to reading/grepping repo files
 - **GPU inference backend (optional)** — route embedding + reranking to a local [`llama-swap`](https://github.com/mostlygeek/llama-swap) server (Qwen3 GGUF on the AMD iGPU via Vulkan, ~3.3× CPU throughput) via `RAG_EMBED_URL` / `RAG_RERANK_URL`; models stay resident side-by-side and each **rotates independently** (unloaded after its own idle `ttl`, exactly like ollama keep_alive)
 - **Matryoshka (MRL) truncation** — HTTP backend outputs are truncated to `RAG_EMBEDDING_DIM` and re-normalized; Qwen3-Embedding-4B at 1024 dims keeps ≥97% retrieval quality vs full 2560
+- **File metadata tags** — per-file entity tags (product, doc type, related docs…) stored as an FTS column; a query hitting a tag (e.g. a product name) scores the whole file's chunks, so cross-file links surface without a graph database. Set via `/rag meta <path> <tags>` or `bin/rag meta`
 - **4 AI tools** — `rag_index`, `rag_query`, `rag_status`, `rag_md_sync` (+ `rag_coverage`)
 
 ## GPU inference backend (llama-swap)
@@ -116,6 +117,25 @@ Note: pi 0.83 does not load `.tgz` or `git:` package URLs directly; use a direct
 
 Models download once from HuggingFace on first use and are cached locally.
 
+## File metadata (entity tags)
+
+A case repo's knowledge points are usually linked — product ↔ documents ↔ review
+opinions ↔ responses. Instead of a graph database, per-file **metadata tags** are
+stored in the FTS index (schema v3, `files.metadata` + `chunks_fts.metadata`):
+
+```bash
+/rag meta "1_初審資料/5_CER/CER MT V5 (20260310) Final.md" "PROD-A 系列 臨床評估報告 CER"
+/rag meta list          # all tagged files
+/rag meta <path>        # show one file's tags
+/rag meta -d <path>     # clear
+```
+
+How it works (方式 3): the tags become an FTS column, so a query hitting a tag
+(e.g. `PROD-A` — a product name that never appears in the file bodies) scores
+every chunk of that file via BM25, and `hybridSearch` boosts the tagged files'chunks. This makes cross-file lookups like “everything about product PROD-A”
+work with zero graph infrastructure. Re-indexing keeps existing tags (the
+`ON CONFLICT` upsert never overwrites `metadata`).
+
 ## Workflow: convert → sync → index
 
 ```bash
@@ -175,6 +195,7 @@ pi                    # then start the session
 |---|---|
 | `/rag index <path>` | Index markdown under a path (chunks → embeds → stores) |
 | `/rag mdsync [path]` | Scan non-md documents for markdown conversion state (checksum check) |
+| `/rag meta [path] [tags…]` | Set/list per-file entity metadata (product, doc type, related docs…); tags are searched via the FTS metadata column. `list` (default), `<path> <tags>` to set, `<path>` to show, `-d <path>` to clear |
 | `/rag coverage [path]` | Completeness report: indexed md vs disk, document conversion state, index health |
 | `/rag coverage --auto` | Auto-fix gaps in priority order: write missing checksums, convert documents (anydoc; OCR via `RAG_OCR_CLI`), re-index |
 | `/rag search <query>` | Hybrid BM25 + vector search (returns recalled parent sections) |

@@ -15,7 +15,7 @@ import type { CoverageReport } from "../coverage.ts";
 
 describe("parseArgs", () => {
   it("defaults to status", () => {
-    expect(parseArgs([])).toEqual({ command: "status", dir: undefined, json: false, help: false });
+    expect(parseArgs([])).toEqual({ command: "status", dir: undefined, json: false, help: false, rest: [] });
   });
 
   it("parses command, --dir, --json, --help", () => {

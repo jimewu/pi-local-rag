@@ -20,8 +20,12 @@ import { VECTOR_DIM } from "./constants.ts";
  * Bump when the physical schema changes in a way that requires a rebuild:
  *   v2 — FTS5 tokenize=trigram (CJK support), parents table, chunks.parent_id,
  *        VECTOR_DIM may have changed (embedding model now configurable).
+ *   v3 — files.metadata + chunks_fts.metadata: per-file entity tags (product,
+ *        doc type, related docs…) become an FTS column so queries hitting the
+ *        metadata (e.g. a product name) score the file's chunks — a lightweight
+ *        cross-file link without a graph database.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** Returns the stored schema version, or 0 when unset (fresh / legacy DB). */
 export function getSchemaVersion(db: Database.Database): number {
@@ -39,16 +43,26 @@ export function initSchema(db: Database.Database) {
   const version = getSchemaVersion(db);
 
   if (version > 0 && version < SCHEMA_VERSION) {
-    // ── v1 → v2 migration ──
-    // The old FTS table used the unicode61 tokenizer (no CJK segmentation)
-    // and chunks_vec may have the wrong dimension. Drop both; they are
-    // rebuilt below from the chunks table (FTS) / lazily re-embedded (vec).
-    db.exec(`
-      DROP TABLE IF EXISTS chunks_fts;
-      DROP TABLE IF EXISTS chunks_vec;
-    `);
-    // Vector data is gone — mark every file for re-embedding.
-    db.prepare("UPDATE files SET embedded = 0").run();
+    if (version < 2) {
+      // ── v1 → v2 migration ──
+      // The old FTS table used the unicode61 tokenizer (no CJK segmentation)
+      // and chunks_vec may have the wrong dimension. Drop both; they are
+      // rebuilt below from the chunks table (FTS) / lazily re-embedded (vec).
+      db.exec(`
+        DROP TABLE IF EXISTS chunks_fts;
+        DROP TABLE IF EXISTS chunks_vec;
+      `);
+      // Vector data is gone — mark every file for re-embedding.
+      db.prepare("UPDATE files SET embedded = 0").run();
+    }
+    // ── v2 → v3 migration ──
+    // files gains a metadata column; chunks_fts is rebuilt below WITH the new
+    // metadata column (vectors/chunks are untouched — no re-embedding needed).
+    const fileCols = db.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>;
+    if (!fileCols.some(c => c.name === "metadata")) {
+      db.exec("ALTER TABLE files ADD COLUMN metadata TEXT");
+    }
+    db.exec(`DROP TABLE IF EXISTS chunks_fts;`);
   }
 
   db.exec(`DROP TRIGGER IF EXISTS chunks_ai; DROP TRIGGER IF EXISTS chunks_ad;`);
@@ -85,16 +99,21 @@ export function initSchema(db: Database.Database) {
     -- tokenize='trigram' gives CJK 3-gram segmentation; unicode61 (the
     -- default) treats a run of Chinese characters as ONE token, so Chinese
     -- keyword search silently fails. Requires SQLite >= 3.34 (bundled).
+    -- 'metadata' holds the file's entity tags (product, doc type, related
+    -- docs...) so a query hitting a tag (e.g. a product name) also scores every
+    -- chunk of that file — a cheap cross-file link, no graph database.
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
       chunk_content,
       file_path,
+      metadata,
       content_rowid=rowid,
       tokenize='trigram'
     );
 
     CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-      INSERT INTO chunks_fts(rowid, chunk_content, file_path)
-      VALUES (new.rowid, new.chunk_content, new.file_path);
+      INSERT INTO chunks_fts(rowid, chunk_content, file_path, metadata)
+      VALUES (new.rowid, new.chunk_content, new.file_path,
+              (SELECT metadata FROM files WHERE path = new.file_path));
     END;
 
     CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
@@ -111,7 +130,8 @@ export function initSchema(db: Database.Database) {
       chunks    INTEGER NOT NULL,
       indexed   TEXT NOT NULL,
       size      INTEGER NOT NULL,
-      embedded  INTEGER NOT NULL DEFAULT 0
+      embedded  INTEGER NOT NULL DEFAULT 0,
+      metadata  TEXT
     );
 
     -- Re-indexing deletes chunks per file (DELETE … WHERE file_path = ?);
@@ -127,13 +147,15 @@ export function initSchema(db: Database.Database) {
   }
 
   // If the FTS table was dropped in the migration (or created empty for a
-  // pre-existing chunks table), re-populate it from the chunks table.
+  // pre-existing chunks table), re-populate it from the chunks table, pulling
+  // each file's metadata alongside.
   const ftsCount = (db.prepare("SELECT COUNT(*) AS c FROM chunks_fts").get() as { c: number }).c;
   const chunkCount = (db.prepare("SELECT COUNT(*) AS c FROM chunks").get() as { c: number }).c;
   if (ftsCount === 0 && chunkCount > 0) {
     db.exec(`
-      INSERT INTO chunks_fts(rowid, chunk_content, file_path)
-      SELECT rowid, chunk_content, file_path FROM chunks;
+      INSERT INTO chunks_fts(rowid, chunk_content, file_path, metadata)
+      SELECT c.rowid, c.chunk_content, c.file_path, f.metadata
+      FROM chunks c LEFT JOIN files f ON f.path = c.file_path;
     `);
   }
 
@@ -318,13 +340,33 @@ export function clearAllVectors(db: Database.Database) {
 export interface FtsMatch { rowid: number; bm25_score: number }
 
 export function searchFts(db: Database.Database, ftsQuery: string, limit: number): FtsMatch[] {
+  // bm25 weights per column: chunk_content 1.0, file_path 0.5, metadata 1.5.
+  // A metadata hit (product name, doc type…) is a strong cross-file signal,
+  // so it outranks a plain filename hit but stays below an in-content hit
+  // combined with its own score.
   return db.prepare(`
-    SELECT chunks_fts.rowid, bm25(chunks_fts) as bm25_score
+    SELECT chunks_fts.rowid, bm25(chunks_fts, 1.0, 0.5, 1.5) as bm25_score
     FROM chunks_fts
     WHERE chunks_fts MATCH ?
-    ORDER BY bm25(chunks_fts)
+    ORDER BY bm25_score
     LIMIT ?
   `).all(ftsQuery, limit) as FtsMatch[];
+}
+
+/** Match the metadata column only (FTS5 column syntax) — used to find which
+ *  FILES carry entity tags matching the query terms, so hybridSearch can
+ *  boost those files' chunks (a product name in metadata should lift the
+ *  whole file, not just the tagged fragments). */
+export function searchFtsMetadata(db: Database.Database, terms: string[], limit: number): FtsMatch[] {
+  if (terms.length === 0) return [];
+  const q = terms.map(t => `metadata:"${t.replace(/"/g, '"')}"`).join(" OR ");
+  return db.prepare(`
+    SELECT chunks_fts.rowid, bm25(chunks_fts, 1.0, 0.5, 1.5) as bm25_score
+    FROM chunks_fts
+    WHERE chunks_fts MATCH ?
+    ORDER BY bm25_score
+    LIMIT ?
+  `).all(q, limit) as FtsMatch[];
 }
 
 // ─── Files ───────────────────────────────────────────────────────────────
@@ -336,24 +378,41 @@ export interface FileRow {
   indexed: string;
   size: number;
   embedded: number;
+  /** Entity tags for this file (product, doc type, related docs…); NULL/absent
+   *  until set via /rag meta or an importer. Surfaced in the FTS metadata
+   *  column so queries hitting a tag score the file's chunks. */
+  metadata?: string | null;
 }
 
-export function getFile(db: Database.Database, path: string): { hash?: string; embedded?: number } | undefined {
-  return db.prepare("SELECT hash, embedded FROM files WHERE path = ?").get(path) as
-    { hash?: string; embedded?: number } | undefined;
+export function getFile(db: Database.Database, path: string): { hash?: string; embedded?: number; metadata?: string | null } | undefined {
+  return db.prepare("SELECT hash, embedded, metadata FROM files WHERE path = ?").get(path) as
+    { hash?: string; embedded?: number; metadata?: string | null } | undefined;
 }
 
 export function upsertFile(
   db: Database.Database,
   path: string, hash: string, chunks: number, indexed: string, size: number, embedded: boolean,
+  metadata?: string | null,
 ) {
+  // metadata is NOT overwritten by ON CONFLICT — re-indexing keeps whatever
+  // tags were set via /rag meta, so a refresh does not wipe them.
   db.prepare(`
-    INSERT INTO files(path, hash, chunks, indexed, size, embedded)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO files(path, hash, chunks, indexed, size, embedded, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(path) DO UPDATE SET
       hash=excluded.hash, chunks=excluded.chunks, indexed=excluded.indexed,
       size=excluded.size, embedded=excluded.embedded
-  `).run(path, hash, chunks, indexed, size, embedded ? 1 : 0);
+  `).run(path, hash, chunks, indexed, size, embedded ? 1 : 0, metadata ?? null);
+}
+
+/** Set (or clear, with null/"") a file's metadata tags and propagate them to
+ *  every FTS row of that file so searches match immediately. */
+export function setFileMetadata(db: Database.Database, path: string, metadata: string | null): void {
+  db.prepare("UPDATE files SET metadata = ? WHERE path = ?").run(metadata, path);
+  db.prepare(`
+    UPDATE chunks_fts SET metadata = ?
+    WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)
+  `).run(metadata, path);
 }
 
 /** Insert-or-replace variant used by the JSON migration path (no upsert semantics needed there). */

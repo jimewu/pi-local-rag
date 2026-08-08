@@ -92,7 +92,10 @@ export async function hybridSearch(
   const distances = vecResults.map(r => r.distance);
   const hasVectors = distances.length > 0;
 
-  // Normalize BM25
+  // Normalize BM25 — bm25() returns NEGATIVE scores where a smaller (more
+  // negative) value is better, so map the best (min) to 1 and the worst (max)
+  // to 0. (This used to be inverted, which flipped the ranking of pure-BM25
+  // hits — exactly what a metadata-only match is.)
   const bm25NormMap = new Map<number, number>();
   if (hasBm25) {
     const bm25Max = Math.max(...bm25Scores);
@@ -104,7 +107,7 @@ export async function hybridSearch(
       }
     } else {
       for (const r of ftsResults) {
-        bm25NormMap.set(r.rowid, (r.bm25_score - bm25Min) / bm25Range);
+        bm25NormMap.set(r.rowid, (bm25Max - r.bm25_score) / bm25Range);
       }
     }
   }
@@ -133,6 +136,16 @@ export async function hybridSearch(
 
   // Build scored results
   const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
+  // Files whose metadata tags match any query term get a file-level boost — a
+  // product name or doc type in metadata should surface that file's chunks
+  // even when the query words never appear in the file bodies themselves.
+  const metadataFiles = new Set<string>();
+  if (terms.length > 0 && chunkMap.size > 0) {
+    for (const m of repo.searchFtsMetadata(database, terms, 1000)) {
+      const c = chunkMap.get(m.rowid);
+      if (c) metadataFiles.add(c.file_path);
+    }
+  }
   const scored: ScoredChunk[] = [];
 
   for (const rowid of allRowIds) {
@@ -153,6 +166,10 @@ export async function hybridSearch(
     const hybrid = hasVectors
       ? alpha * bm25Final + (1 - alpha) * vecNorm
       : bm25Final;
+    // Metadata boost: +0.2 for chunks of files whose entity tags matched,
+    // capped at 1. Keeps a metadata hit competitive against strong content
+    // hits (e.g. 'PROD-A 風險利益' surfaces the tagged questionnaire file).
+    const boosted = metadataFiles.has(c.file_path) ? Math.min(1, hybrid + 0.2) : hybrid;
 
     scored.push({
       chunk: {
@@ -161,7 +178,7 @@ export async function hybridSearch(
         hash: c.chunk_hash, indexed: c.indexed_at, tokens: c.tokens,
         parentId: c.parent_id,
       },
-      bm25: bm25Final, vector: vecNorm, hybrid,
+      bm25: bm25Final, vector: vecNorm, hybrid: boosted,
     });
   }
 

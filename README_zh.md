@@ -22,6 +22,7 @@
 - **自動注入** — 每次 agent turn 前將相關的 **parent 章節**附加在使用者提示後（對 KV-cache 友善），並附**三步回答策略**：(1) 注入內容足夠時直接回答；(2) 不足時先跑 `rag_query` 工具主動、針對性地搜尋索引；(3) 主動 RAG 仍不足，才退回用 read/grep 翻看 repo 檔案
 - **GPU 推理 backend（選用）** — 可透過 `RAG_EMBED_URL` / `RAG_RERANK_URL` 將 embedding + reranking 導向本機 [`llama-swap`](https://github.com/mostlygeek/llama-swap) server（Qwen3 GGUF 跑在 AMD iGPU，Vulkan，吞吐約 CPU 的 3.3 倍）；兩模型**並存**且各自**獨立輪轉**（各自 idle `ttl` 後卸載，等同 ollama keep_alive 語意）
 - **Matryoshka（MRL）截斷** — HTTP backend 輸出截斷到 `RAG_EMBEDDING_DIM` 並重新正規化；Qwen3-Embedding-4B 在 1024 維時仍保留 ≥97% 檢索品質（對比完整 2560 維）
+- **檔案 metadata 標記** — 每檔案的實體標記（產品、文件類型、相關文件…）存入 FTS 欄位；查詢命中標記（如產品名）會提升該檔案所有 chunk 的分數——跨檔案關聯不需圖資料庫。可用 `/rag meta <path> <tags>` 或 `bin/rag meta` 設定
 - **4 個 AI 工具** — `rag_index`、`rag_query`、`rag_status`、`rag_md_sync`（另有 `rag_coverage`）
 
 ## GPU 推理 backend（llama-swap）
@@ -112,6 +113,24 @@ pi install /path/to/pi-local-rag
 
 模型首次使用時從 HuggingFace 下載一次並快取於本機。
 
+## 檔案 metadata（實體標記）
+
+case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見 ↔ 回覆。不建圖資料庫，
+改為把每檔案的 **metadata 標記**存入 FTS 索引（schema v3：`files.metadata` + `chunks_fts.metadata`）：
+
+```bash
+/rag meta "1_初審資料/5_CER/CER MT V5 (20260310) Final.md" "PROD-A 系列 臨床評估報告 CER"
+/rag meta list          # 列出所有已標記檔案
+/rag meta <path>        # 顯示單一檔案的標記
+/rag meta -d <path>     # 清除
+```
+
+運作原理（方式 3）：標記成為 FTS 欄位——查詢命中標記（如 `PROD-A`，一個
+從不出現在檔案正文的產品名）時，BM25 為該檔案的所有 chunk 加分，且
+`hybridSearch` 對被標記檔案的 chunk 提升分數。跨檔案查詢（如「產品 PROD-A
+的全部資料」）因此不需任何圖基礎設施即可達成。重新索引不會覆蓋既有標記
+（`ON CONFLICT` upsert 不動 `metadata`）。
+
 ## 工作流：轉檔 → 同步 → 索引
 
 ```bash
@@ -167,6 +186,7 @@ pi                    # 然後啟動 session 開始對話
 |---|---|
 | `/rag index <path>` | 索引路徑下的 markdown |
 | `/rag mdsync [path]` | 掃描非 md 文件的 markdown 轉檔狀態（checksum 檢查） |
+| `/rag meta [path] [tags…]` | 設定/列出每檔案的實體 metadata（產品、文件類型、相關文件…）；tags 經由 FTS metadata 欄位搜尋。`list`（預設）、`<path> <tags>` 設定、`<path>` 顯示、`-d <path>` 清除 |
 | `/rag coverage [path]` | 完整性報告：已索引 md vs 磁碟、文件轉檔狀態、索引健康 |
 | `/rag coverage --auto` | 依優先序自動補齊：補 checksum、轉檔（anydoc；OCR 需 `RAG_OCR_CLI`）、重新索引 |
 | `/rag search <query>` | 混合 BM25 + 向量檢索（回傳召回的 parent 章節） |
