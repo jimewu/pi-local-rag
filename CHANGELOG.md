@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.6
+
+- **Metadata seed (`rag-metadata.json`)** — a version-controlled source of
+  truth for per-file tags at the repo root; keys are paths relative to the
+  repo root (stable across relocations). Every index/rebuild/refresh/auto
+  re-applies the seed automatically (`indexFiles` applies it on completion),
+  and `/rag meta seed` / `bin/rag meta seed` apply it on demand. Entries
+  whose path matches no indexed file are reported to stderr; files not
+  listed keep their existing tags.
+- Verified end-to-end on the real case repo through both entry points:
+  `bin/rag meta seed` (CLI) and `/rag meta seed` (pi extension), plus the
+  automatic path (cleared tags are restored by `bin/rag auto`).
+
 ## 0.5.5
 
 - **File metadata (entity tags, 方式 3 / FTS column)** — per-file tags

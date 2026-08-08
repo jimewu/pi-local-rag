@@ -128,6 +128,7 @@ stored in the FTS index (schema v3, `files.metadata` + `chunks_fts.metadata`):
 /rag meta list          # all tagged files
 /rag meta <path>        # show one file's tags
 /rag meta -d <path>     # clear
+/rag meta seed          # apply the seed file (rag-metadata.json) to the index
 ```
 
 How it works (方式 3): the tags become an FTS column, so a query hitting a tag
@@ -135,6 +136,26 @@ How it works (方式 3): the tags become an FTS column, so a query hitting a tag
 every chunk of that file via BM25, and `hybridSearch` boosts the tagged files'chunks. This makes cross-file lookups like “everything about product PROD-A”
 work with zero graph infrastructure. Re-indexing keeps existing tags (the
 `ON CONFLICT` upsert never overwrites `metadata`).
+
+### Metadata seed (`rag-metadata.json`)
+
+For maintenance (and so tags survive a rebuild), keep the tags in a seed file
+at the repo root — version-controlled and travels with the case repo:
+
+```json
+{
+  "1_初審資料/5_CER/CER MT V5 (20260310) Final.md": "PROD-A 系列 臨床評估報告 CER",
+  "2_FU1委員意見/…/MT TD …20260515 的複本.md": "PROD-A PROD-A FU1 審查意見"
+}
+```
+
+Keys are paths **relative to the repo root** (stable across relocations); paths
+must match the indexed files exactly (including directory levels). Every
+`/rag index` / `rebuild` / `refresh` / `auto` run re-applies the seed
+automatically (`indexFiles` applies it on completion), and `/rag meta seed`
+(or `bin/rag meta seed`) applies it on demand. Entries whose path does not
+match an indexed file are reported to stderr. Files not listed in the seed keep
+their existing tags.
 
 ## Workflow: convert → sync → index
 

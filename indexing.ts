@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import Database from "better-sqlite3";
 import { getDbConn, type IndexStats } from "./db.ts";
 import { embedBatch, activeEmbeddingModel } from "./embed.ts";
+import { applyMetadataSeed } from "./metadata.ts";
 import { chunkForFile, extractText, sha256, type ChunkedDoc } from "./chunking.ts";
 import * as repo from "./repository.ts";
 
@@ -275,6 +276,16 @@ export async function indexFiles(
     progress?.onSave?.();
     repo.setMetadata(database, repo.MetadataKey.LastBuild, new Date().toISOString());
     repo.setMetadata(database, repo.MetadataKey.EmbeddingModel, activeEmbeddingModel());
+
+    // Apply the metadata seed (repo/rag-metadata.json) so tags track the
+    // index lifecycle: after any index/rebuild/refresh the listed files get
+    // their tags (re)applied. Failures are logged, never fatal.
+    try {
+      const applied = applyMetadataSeed(database, process.cwd());
+      if (applied > 0 && hadCallbacks) process.stderr.write(`[rag] metadata seed applied to ${applied} file(s)\n`);
+    } catch (e) {
+      process.stderr.write(`[rag] metadata seed failed: ${(e as Error).message}\n`);
+    }
 
     return { indexed: toIndex.length, chunks: chunked, skipped, durationMs: Date.now() - startMs };
   } finally {

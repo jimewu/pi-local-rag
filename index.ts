@@ -50,6 +50,7 @@ import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
 import { getDbConn, loadIndex, saveIndex, getIndexStats } from "./db.ts";
 import * as repo from "./repository.ts";
+import { applyMetadataSeed, metadataSeedPath } from "./metadata.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { scanMarkdownSync } from "./md-sync.ts";
 import { computeCoverage, coverageVerdictLabel } from "./coverage.ts";
@@ -410,6 +411,12 @@ export default function (pi: ExtensionAPI) {
         const database = getDbConn();
         const metaArgs = parts.slice(1);
         const th = ctx.ui.theme;
+
+        if (metaArgs[0] === "seed") {
+          const applied = applyMetadataSeed(database, process.cwd());
+          ctx.ui.notify(`Metadata seed applied to ${applied} file(s) (${metadataSeedPath(process.cwd())})`, "info");
+          return;
+        }
 
         const showMeta = (path: string): void => {
           const f = repo.getFile(database, path);

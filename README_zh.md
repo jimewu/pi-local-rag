@@ -123,6 +123,7 @@ case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見
 /rag meta list          # 列出所有已標記檔案
 /rag meta <path>        # 顯示單一檔案的標記
 /rag meta -d <path>     # 清除
+/rag meta seed          # 套用種子檔（rag-metadata.json）到索引
 ```
 
 運作原理（方式 3）：標記成為 FTS 欄位——查詢命中標記（如 `PROD-A`，一個
@@ -130,6 +131,24 @@ case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見
 `hybridSearch` 對被標記檔案的 chunk 提升分數。跨檔案查詢（如「產品 PROD-A
 的全部資料」）因此不需任何圖基礎設施即可達成。重新索引不會覆蓋既有標記
 （`ON CONFLICT` upsert 不動 `metadata`）。
+
+### Metadata 種子檔（`rag-metadata.json`）
+
+為方便維護（並讓標記在重建後仍然存在），把標記集中放在 repo 根目錄的
+種子檔——可版本控制、隨 case repo 一起搬動：
+
+```json
+{
+  "1_初審資料/5_CER/CER MT V5 (20260310) Final.md": "PROD-A 系列 臨床評估報告 CER",
+  "2_FU1委員意見/…/MT TD …20260515 的複本.md": "PROD-A PROD-A FU1 審查意見"
+}
+```
+
+鍵值是**相對於 repo 根**的路徑（搬動後仍穩定）；路徑必須與已索引檔案完全
+一致（含目錄層級）。每次 `/rag index` / `rebuild` / `refresh` / `auto` 都會
+**自動重新套用**種子檔（`indexFiles` 完成時套用），也可用 `/rag meta seed`
+（或 `bin/rag meta seed`）手動套用。路徑未命中任何已索引檔案時會寫到
+stderr 提示。種子檔沒列到的檔案保留既有標記。
 
 ## 工作流：轉檔 → 同步 → 索引
 

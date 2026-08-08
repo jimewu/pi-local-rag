@@ -309,6 +309,12 @@ export async function main(argv: string[]): Promise<number> {
       case "meta": {
         const db = getDbConn();
         const metaArgs = args.rest ?? [];
+        if (metaArgs[0] === "seed") {
+          const { applyMetadataSeed, metadataSeedPath } = await import("./metadata.ts");
+          const applied = applyMetadataSeed(db, process.cwd());
+          console.log(GREEN + `Metadata seed applied to ${applied} file(s)` + RST + D + ` (${metadataSeedPath(process.cwd())})` + RST);
+          return 0;
+        }
         if (metaArgs.length === 0 || metaArgs[0] === "list") {
           const rows = (await import("./repository.ts")).listFiles(db).filter(f => f.metadata);
           console.log(B + `📎 File metadata (${rows.length})` + RST);
