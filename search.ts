@@ -58,7 +58,8 @@ export async function hybridSearch(
   query: string,
   limit = 10,
   alpha = 0.4,
-  _db?: Database.Database
+  _db?: Database.Database,
+  options?: { rerank?: boolean },
 ): Promise<ScoredChunk[]> {
   const database = _db ?? getDbConn();
 
@@ -191,7 +192,10 @@ export async function hybridSearch(
   }
 
   // ── Rerank (optional cross-encoder) ──────────────────────────────────────
-  if (isRerankerEnabled()) {
+  // Skippable: reranking is expensive (~0.6s per passage on the local GPU),
+  // so low-latency callers like RAG auto-injection pass { rerank: false } —
+  // hybrid BM25+vector ordering already surfaces the relevant chunks.
+  if (options?.rerank !== false && isRerankerEnabled()) {
     const candidates = filtered.slice(0, RERANK_TOP_K);
     const passages = candidates.map(c => c.parent?.content ?? c.chunk.content);
     const scores = await rerank(query, passages);

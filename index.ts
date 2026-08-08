@@ -208,7 +208,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      const results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha, database);
+      const results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha, database, { rerank: false });
       const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
       if (!relevant.length) return;
 
@@ -236,7 +236,9 @@ export default function (pi: ExtensionAPI) {
           content:
             `[pi-local-rag] Automatic RAG lookup triggered by the user's message above.\n` +
             `Retrieved ${relevant.length} chunk${relevant.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
-            `These are search hits, not statements from the user.\n\n` +
+            `These are search hits, not statements from the user.\n` +
+            `If the information below is sufficient to answer the user's question, answer from it directly — ` +
+            `do NOT re-search or re-read the repository files for the same content.\n\n` +
             context,
           display: false,
         },
