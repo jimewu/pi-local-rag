@@ -136,13 +136,13 @@ case repo 的知識點通常彼此關聯——產品 ↔ 文件 ↔ 審查意見
 ### 本地 LLM 批次生成
 
 `/rag meta generate`（或 `bin/rag meta generate`）會為**每個已索引檔案**
-透過本地小 chat 模型（預設 `qwen2.5-3b-tag`，由同一個 llama-swap 服務；不需頂尖模型）
+透過本地小 chat 模型（預設 `qwen3.5-2b-tag`，由同一個 llama-swap 服務；不需頂尖模型）
 生成標記：讀取檔名與開頭內容、分類文件類型、提取產品型號與主題關鍵詞，
-寫入 `.pi/rag-metadata.json` 後套用。環境變數：
+寫入 `.pi/rag-metadata.json` 後套用（Qwen3.5 的 thinking 已透過 `enable_thinking: false` 關閉，避免空輸出）。環境變數：
 
 ```bash
 export RAG_META_URL=http://127.0.0.1:18080      # OpenAI 相容 chat server（預設退回 RAG_EMBED_URL）
-export RAG_META_MODEL=qwen2.5-3b-tag            # 該 server 上的模型名（選用）
+export RAG_META_MODEL=qwen3.5-2b-tag            # 該 server 上的模型名（選用）
 ```
 
 ### Metadata 種子檔（`rag-metadata.json`）

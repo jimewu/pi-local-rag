@@ -1,6 +1,6 @@
 {
   "name": "pi-local-rag",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "Markdown-only hybrid RAG for the Pi coding agent (jimewu fork): bge-m3 multilingual embeddings, cross-encoder reranker, parent-child chunking, FTS5 trigram CJK search, and an md-sync scanner that verifies docx/pdf/csv → markdown conversion via sha256 checksums. Zero cloud dependency.",
   "type": "module",
   "main": "./index.ts",

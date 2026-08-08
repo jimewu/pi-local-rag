@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.8
+
+- **Tagger upgraded to Qwen3.5-2B** (unsloth GGUF, Q4_K_M) — much newer and
+  smaller than Qwen2.5-3B with better extraction: concrete model numbers
+  (e.g. MT-850) are now captured. Requires llama.cpp b10330+ (Qwen3.5
+  architecture support; b10301 produced empty output for Qwen3.5).
+- **llama.cpp upgraded b10301 → b10330** (Vulkan build; verified embedding +
+  reranker behave identically). Old build kept at /usr/local/lib/llama.cpp.b10301.
+- **`enable_thinking: false`** in the tag-extraction request — Qwen3.5's
+  reasoning mode can emit only reasoning_content with an empty answer on
+  llama.cpp; disabling it makes generation stable.
+- Verified: 158 files re-tagged; metadata hits rank tagged files first
+  (MT-850 → CERs, 審查意見 → review docs, 紅外線溫度計 → CIP).
+
 ## 0.5.7
 
 - **`meta generate` (CLI + `/rag meta generate`)** — batch-tag every indexed

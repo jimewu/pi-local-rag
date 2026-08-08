@@ -141,14 +141,14 @@ work with zero graph infrastructure. Re-indexing keeps existing tags (the
 ### Batch generation with a local LLM
 
 `/rag meta generate` (or `bin/rag meta generate`) tags **every indexed file**
-through a small local chat model (default `qwen2.5-3b-tag` served by the same
+through a small local chat model (default `qwen3.5-2b-tag` served by the same
 llama-swap instance; no frontier model needed). It reads each file name + leading
-content, classifies the document type and extracts product model + topic keywords
+content, classifies the document type and extracts product model + topic keywords (Qwen3.5 thinking is disabled via `enable_thinking: false`, which avoids empty outputs)
 into `.pi/rag-metadata.json`, then applies. Env:
 
 ```bash
 export RAG_META_URL=http://127.0.0.1:18080      # OpenAI-compatible chat server (default: falls back to RAG_EMBED_URL)
-export RAG_META_MODEL=qwen2.5-3b-tag            # model name on that server (optional)
+export RAG_META_MODEL=qwen3.5-2b-tag            # model name on that server (optional)
 ```
 
 ### Metadata seed (`rag-metadata.json`)

@@ -118,6 +118,9 @@ export async function extractTags(path: string, content: string, opts: MetaGener
       messages: [{ role: "user", content: extractTagsPrompt(path, content) }],
       max_tokens: 120,
       temperature: 0.2,
+      // Qwen3.5 is a reasoning model; with thinking left on it can produce
+      // only reasoning_content and an empty final answer on this llama.cpp.
+      chat_template_kwargs: { enable_thinking: false },
     }),
     signal: AbortSignal.timeout(opts.timeoutMs ?? 90_000),
   });

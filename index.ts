@@ -424,7 +424,7 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify("RAG_META_URL (or RAG_EMBED_URL) required — e.g. http://127.0.0.1:18080", "error");
             return;
           }
-          const model = process.env.RAG_META_MODEL ?? "qwen2.5-3b-tag";
+          const model = process.env.RAG_META_MODEL ?? "qwen3.5-2b-tag";
           ctx.ui.notify(`⏳ Generating metadata tags via ${model}…`, "info");
           let last = 0;
           const result = await generateMetadataSeed(database, process.cwd(), { llmUrl, model }, (done, total) => {
